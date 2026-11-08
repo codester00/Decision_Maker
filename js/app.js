@@ -1,0 +1,1075 @@
+import { createStore } from './store.js';
+
+const $app = document.getElementById('app');
+const $modal = document.getElementById('modal-root');
+const $toast = document.getElementById('toast-root');
+
+/* =====================================================================
+   DOM helpers
+   h() builds elements safely (user text is never parsed as HTML).
+   render() patches the new tree into the old one so that inputs keep
+   focus and typed text while other phones' changes stream in.
+   ===================================================================== */
+
+const EVENTS = ['click', 'submit', 'input', 'change', 'keydown'];
+
+function h(tag, props, ...children) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'class') el.className = v;
+    else if (k.startsWith('on')) el['on' + k.slice(2).toLowerCase()] = v;
+    else if (k === 'value') el.value = v;
+    else if (k === 'checked' || k === 'disabled') el[k] = true;
+    else el.setAttribute(k, v === true ? '' : String(v));
+  }
+  for (const c of children.flat(Infinity)) {
+    if (c == null || c === false) continue;
+    el.append(c instanceof Node ? c : String(c));
+  }
+  return el;
+}
+
+const keyOf = (n) => (n.nodeType === 1 ? n.id || n.dataset.key || null : null);
+const sameKind = (a, b) => a.nodeType === b.nodeType && a.nodeName === b.nodeName && keyOf(a) === keyOf(b);
+
+function patch(oldEl, newEl) {
+  if (oldEl.nodeType === 3) {
+    if (oldEl.data !== newEl.data) oldEl.data = newEl.data;
+    return;
+  }
+  for (const { name } of [...oldEl.attributes]) if (!newEl.hasAttribute(name)) oldEl.removeAttribute(name);
+  for (const { name, value } of [...newEl.attributes]) if (oldEl.getAttribute(name) !== value) oldEl.setAttribute(name, value);
+  for (const ev of EVENTS) oldEl['on' + ev] = newEl['on' + ev];
+  if ('disabled' in newEl) oldEl.disabled = newEl.disabled;
+  if (newEl.tagName === 'INPUT') {
+    if (newEl.type === 'checkbox') oldEl.checked = newEl.checked;
+    return; // keep whatever the user has typed
+  }
+  if (newEl.tagName === 'TEXTAREA') return;
+  patchChildren(oldEl, [...newEl.childNodes]);
+}
+
+function patchChildren(parent, newKids) {
+  const oldKids = [...parent.childNodes];
+  const keyed = new Map();
+  for (const k of oldKids) { const key = keyOf(k); if (key) keyed.set(key, k); }
+  const used = new Set();
+  let oi = 0;
+  const result = newKids.map((nk) => {
+    let match = null;
+    const key = keyOf(nk);
+    if (key) match = keyed.get(key) || null;
+    else {
+      while (oi < oldKids.length && (keyOf(oldKids[oi]) || used.has(oldKids[oi]))) oi++;
+      if (oi < oldKids.length) match = oldKids[oi++];
+    }
+    if (match && !used.has(match) && sameKind(match, nk)) {
+      used.add(match);
+      patch(match, nk);
+      return match;
+    }
+    return nk;
+  });
+  for (const k of oldKids) if (!used.has(k)) k.remove();
+  result.forEach((node, i) => {
+    if (parent.childNodes[i] !== node) parent.insertBefore(node, parent.childNodes[i] || null);
+  });
+}
+
+/* =====================================================================
+   Small utilities
+   ===================================================================== */
+
+class UserError extends Error {}
+class CodeTaken extends Error {}
+
+const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O or 1/I confusion
+function randomCode(n) {
+  const a = crypto.getRandomValues(new Uint32Array(n));
+  return Array.from(a, (x) => ALPHABET[x % ALPHABET.length]).join('');
+}
+const uid = () => randomCode(12);
+const normCode = (s) => (s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = crypto.getRandomValues(new Uint32Array(1))[0] % (i + 1);
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function listJoin(names) {
+  if (names.length <= 1) return names.join('');
+  return names.slice(0, -1).join(', ') + ' and ' + names[names.length - 1];
+}
+
+function nameError(name, existing) {
+  if (!name) return 'Enter a name.';
+  if (name.length > 30) return 'Keep names under 30 characters.';
+  if (existing.some((n) => n.toLowerCase() === name.toLowerCase())) return `${name} is already in the list.`;
+  return null;
+}
+
+const prefs = {
+  get(k, d = null) {
+    try { const v = localStorage.getItem('fdm:pref:' + k); return v == null ? d : JSON.parse(v); } catch { return d; }
+  },
+  set(k, v) {
+    try {
+      if (v == null) localStorage.removeItem('fdm:pref:' + k);
+      else localStorage.setItem('fdm:pref:' + k, JSON.stringify(v));
+    } catch { /* storage unavailable */ }
+  },
+};
+
+// Identifies this phone. In demo mode it is per tab, so tabs act as separate phones.
+function getClientId(mode) {
+  const storage = mode === 'local' ? sessionStorage : localStorage;
+  try {
+    let id = storage.getItem('fdm:client');
+    if (!id) { id = uid(); storage.setItem('fdm:client', id); }
+    return id;
+  } catch {
+    return uid();
+  }
+}
+
+async function run(fn) {
+  try {
+    await fn();
+    return true;
+  } catch (e) {
+    if (!(e instanceof UserError)) console.error(e);
+    toast(e instanceof UserError ? e.message : 'Something went wrong. Check your internet connection and try again.');
+    return false;
+  }
+}
+
+/* =====================================================================
+   Dialogs and toasts
+   ===================================================================== */
+
+function openModal(build) {
+  return new Promise((resolve) => {
+    let overlay;
+    const onKey = (e) => { if (e.key === 'Escape') close(undefined); };
+    function close(val) {
+      overlay.remove();
+      document.removeEventListener('keydown', onKey);
+      resolve(val);
+    }
+    overlay = h('div', { class: 'overlay', onClick: (e) => { if (e.target === overlay) close(undefined); } },
+      h('div', { class: 'dialog', role: 'dialog', 'aria-modal': 'true' }, build(close)));
+    document.addEventListener('keydown', onKey);
+    $modal.append(overlay);
+    const first = overlay.querySelector('input') || overlay.querySelector('.btn.primary');
+    if (first) first.focus();
+  });
+}
+
+function confirmDialog({ title, message, ok = 'OK', danger = false }) {
+  return openModal((close) => [
+    h('h2', {}, title),
+    message && h('p', {}, message),
+    h('div', { class: 'dialog-actions' },
+      h('button', { class: 'btn text', onClick: () => close(false) }, 'Cancel'),
+      h('button', { class: danger ? 'btn danger' : 'btn primary', onClick: () => close(true) }, ok)),
+  ]).then((v) => !!v);
+}
+
+function choiceDialog({ title, message, choices }) {
+  return openModal((close) => [
+    h('h2', {}, title),
+    message && h('p', {}, message),
+    h('div', { class: 'dialog-actions' },
+      h('button', { class: 'btn text', onClick: () => close(null) }, 'Cancel'),
+      choices.map((c) => h('button', { class: c.primary ? 'btn primary' : 'btn', onClick: () => close(c.value) }, c.label))),
+  ]);
+}
+
+function promptDialog({ title, message, value = '', placeholder = 'Name', ok = 'Save', validate = () => null }) {
+  return openModal((close) => {
+    const input = h('input', { class: 'input', value, placeholder, maxlength: 30, autocomplete: 'off' });
+    const err = h('div', { class: 'error-text' });
+    const submit = (e) => {
+      e.preventDefault();
+      const v = input.value.trim();
+      const msg = validate(v);
+      if (msg) { err.textContent = msg; input.focus(); return; }
+      close(v);
+    };
+    return h('form', { onSubmit: submit },
+      h('h2', {}, title),
+      message && h('p', { class: 'muted' }, message),
+      input, err,
+      h('div', { class: 'dialog-actions' },
+        h('button', { type: 'button', class: 'btn text', onClick: () => close(null) }, 'Cancel'),
+        h('button', { type: 'submit', class: 'btn primary' }, ok)));
+  }).then((v) => v ?? null);
+}
+
+let toastTimer;
+function toast(message, { action, onAction, ms = 5000 } = {}) {
+  clearTimeout(toastTimer);
+  const el = h('div', { class: 'toast', role: 'status' },
+    h('span', {}, message),
+    action && h('button', { class: 'btn text', onClick: () => { el.remove(); onAction(); } }, action));
+  const bar = document.getElementById('bottombar');
+  $toast.style.bottom = (bar ? bar.offsetHeight + 12 : 16) + 'px';
+  $toast.replaceChildren(el);
+  toastTimer = setTimeout(() => el.remove(), ms);
+}
+
+async function shareLink(title, text, url) {
+  if (navigator.share) {
+    try { await navigator.share({ title, text, url }); return; } catch (e) { if (e.name === 'AbortError') return; }
+  }
+  try {
+    await navigator.clipboard.writeText(url);
+    toast('Link copied. Paste it into a message.');
+  } catch {
+    openModal((close) => [h('h2', {}, 'Share this link'), h('p', { class: 'link-box' }, url),
+      h('div', { class: 'dialog-actions' }, h('button', { class: 'btn primary', onClick: () => close() }, 'Done'))]);
+  }
+}
+
+const appUrl = () => location.origin + location.pathname;
+const inviteUrl = (code) => `${appUrl()}#/join/${code}`;
+const gameUrl = (code) => `${appUrl()}#/game/${code}`;
+
+/* =====================================================================
+   State, routing and subscriptions
+   ===================================================================== */
+
+const S = {
+  store: null,
+  storeError: null,
+  clientId: null,
+  familyCode: prefs.get('familyCode'),
+  family: undefined, // undefined = loading, null = not found
+  game: undefined,
+  route: parseRoute(),
+  mode: 'normal', // normal | delete | edit
+  draftNames: [],
+  myOptionIds: new Set(), // only kept in memory, never sent anywhere
+  inApp: false,
+};
+
+function parseRoute() {
+  const p = location.hash.replace(/^#\/?/, '').split('/');
+  if (p[0] === 'stats') return { name: 'stats' };
+  if (p[0] === 'game' && p[1]) return { name: 'game', code: normCode(p[1]) };
+  if (p[0] === 'join' && p[1]) return { name: 'joinFamily', code: normCode(p[1]) };
+  return { name: 'home' };
+}
+
+function navigate(hash) {
+  S.inApp = true;
+  location.hash = hash;
+}
+
+function goBack() {
+  if (S.inApp) history.back();
+  else location.replace('#/');
+}
+
+window.addEventListener('hashchange', () => {
+  S.route = parseRoute();
+  S.mode = 'normal';
+  $modal.replaceChildren();
+  if (S.route.name === 'joinFamily' && S.route.code === S.familyCode) location.replace('#/');
+  syncSubscriptions();
+  render();
+});
+
+let famSub = { code: null, off: null };
+let gameSub = { code: null, off: null };
+
+function onSubError(err) {
+  toast(err && err.code === 'permission-denied'
+    ? 'The server refused access. Check the Firebase setup (see README).'
+    : 'Lost connection to the server.');
+}
+
+function syncSubscriptions() {
+  if (!S.store) return;
+
+  if (famSub.code !== S.familyCode) {
+    if (famSub.off) famSub.off();
+    famSub = { code: S.familyCode, off: null };
+    S.family = undefined;
+    if (S.familyCode) {
+      famSub.off = S.store.watch('families', S.familyCode, (d) => { S.family = d; render(); }, onSubError);
+    }
+  }
+
+  const gc = S.route.name === 'game' ? S.route.code : null;
+  if (gameSub.code !== gc) {
+    if (gameSub.off) gameSub.off();
+    gameSub = { code: gc, off: null };
+    S.game = undefined;
+    S.myOptionIds = new Set();
+    if (gc) {
+      gameSub.off = S.store.watch('games', gc, (d) => {
+        const prev = S.game;
+        S.game = d;
+        if (d === null && S.family && S.family.activeGame === gc) {
+          run(() => updateFamily((f) => { if (f.activeGame === gc) f.activeGame = null; }));
+        }
+        if (isMyTurn(d) && !(isMyTurn(prev) && prev.turn === d.turn && prev.options.length === d.options.length)) {
+          if (navigator.vibrate) navigator.vibrate(200);
+        }
+        render();
+      }, onSubError);
+    }
+  }
+}
+
+function setFamily(code) {
+  prefs.set('familyCode', code);
+  S.familyCode = code;
+  S.mode = 'normal';
+  syncSubscriptions();
+  if (location.hash === '' || location.hash === '#/') render();
+  else location.replace('#/');
+}
+
+/* =====================================================================
+   Family actions (all run as atomic transactions)
+   ===================================================================== */
+
+function updateFamily(fn) {
+  return S.store.update('families', S.familyCode, (cur) => {
+    if (!cur) throw new UserError('This family no longer exists.');
+    const f = structuredClone(cur);
+    fn(f);
+    return f;
+  });
+}
+
+const newMember = (name) => ({ id: uid(), name, decisions: 0, positions: {} });
+
+async function createFamily(names) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = randomCode(6);
+    try {
+      await S.store.update('families', code, (cur) => {
+        if (cur) throw new CodeTaken();
+        return { members: names.map(newMember), activeGame: null, createdAt: Date.now() };
+      });
+      S.draftNames = [];
+      setFamily(code);
+      return;
+    } catch (e) {
+      if (!(e instanceof CodeTaken)) throw e;
+    }
+  }
+  throw new UserError('Could not create a family code. Please try again.');
+}
+
+async function joinFamily(code) {
+  const f = await S.store.get('families', code);
+  if (!f) throw new UserError(`No family found with code ${code}.`);
+  setFamily(code);
+  toast('Joined the family.');
+}
+
+function leaveFamily() {
+  prefs.set('familyCode', null);
+  S.familyCode = null;
+  syncSubscriptions();
+  render();
+}
+
+function addMember(name) {
+  return updateFamily((f) => {
+    const err = nameError(name, f.members.map((m) => m.name));
+    if (err) throw new UserError(err);
+    f.members.push(newMember(name));
+  });
+}
+
+function renameMember(id, name) {
+  return updateFamily((f) => {
+    const m = f.members.find((x) => x.id === id);
+    if (!m) throw new UserError('That person was removed on another phone.');
+    const err = nameError(name, f.members.filter((x) => x.id !== id).map((x) => x.name));
+    if (err) throw new UserError(err);
+    m.name = name;
+  });
+}
+
+function removeMember(id) {
+  return updateFamily((f) => { f.members = f.members.filter((m) => m.id !== id); });
+}
+
+async function decide(id) {
+  let info = null;
+  await updateFamily((f) => {
+    const i = f.members.findIndex((m) => m.id === id);
+    if (i < 0) throw new UserError('That person was removed on another phone.');
+    const [m] = f.members.splice(i, 1);
+    m.decisions = (m.decisions || 0) + 1;
+    m.positions = m.positions || {};
+    m.positions[i + 1] = (m.positions[i + 1] || 0) + 1;
+    f.members.push(m);
+    info = { id, from: i, name: m.name };
+  });
+  toast(`${info.name} made the decision.`, { action: 'Undo', onAction: () => run(() => undoDecide(info)) });
+}
+
+function undoDecide({ id, from }) {
+  return updateFamily((f) => {
+    const i = f.members.findIndex((m) => m.id === id);
+    if (i < 0) throw new UserError('Too late to undo.');
+    const [m] = f.members.splice(i, 1);
+    m.decisions = Math.max(0, (m.decisions || 0) - 1);
+    const k = String(from + 1);
+    if (m.positions && m.positions[k]) {
+      m.positions[k]--;
+      if (!m.positions[k]) delete m.positions[k];
+    }
+    f.members.splice(Math.min(from, f.members.length), 0, m);
+  });
+}
+
+/* =====================================================================
+   Elimination Game actions
+   A game lives in its own document. It never touches the priority list
+   or statistics, stores no record of who suggested or eliminated what,
+   and is deleted when the host ends it.
+   ===================================================================== */
+
+function updateGame(fn) {
+  return S.store.update('games', S.route.code, (cur) => {
+    if (!cur) throw new UserError('This game has ended.');
+    const g = structuredClone(cur);
+    return fn(g) === null ? null : g;
+  });
+}
+
+const playerById = (g, id) => g.players.find((p) => p.id === id);
+const currentPlayer = (g) => playerById(g, g.order[g.turn]);
+const isMyTurn = (g) => !!g && g.phase === 'eliminate' && currentPlayer(g)?.device === S.clientId;
+
+async function createGame() {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = randomCode(6);
+    try {
+      await S.store.update('games', code, (cur) => {
+        if (cur) throw new CodeTaken();
+        return {
+          host: S.clientId,
+          phase: 'lobby',
+          players: [],
+          options: [],
+          order: [],
+          turn: 0,
+          winner: null,
+          familyNames: S.family ? S.family.members.map((m) => m.name) : [],
+          createdAt: Date.now(),
+        };
+      });
+      if (S.family) await updateFamily((f) => { f.activeGame = code; });
+      navigate('#/game/' + code);
+      return;
+    } catch (e) {
+      if (!(e instanceof CodeTaken)) throw e;
+    }
+  }
+  throw new UserError('Could not create a game code. Please try again.');
+}
+
+function addPlayer(name) {
+  return updateGame((g) => {
+    if (g.phase !== 'lobby') throw new UserError('The game has already moved on.');
+    const err = nameError(name, g.players.map((p) => p.name));
+    if (err) throw new UserError(err);
+    g.players.push({ id: uid(), name, device: S.clientId });
+  });
+}
+
+function removePlayer(id) {
+  return updateGame((g) => {
+    if (g.phase !== 'lobby') throw new UserError('Players can only be removed before options are added.');
+    g.players = g.players.filter((p) => p.id !== id);
+  });
+}
+
+function toOptions() {
+  return updateGame((g) => {
+    if (g.players.length < 2) throw new UserError('Need at least 2 players.');
+    g.phase = 'options';
+  });
+}
+
+function backToLobby() {
+  return updateGame((g) => { g.phase = 'lobby'; });
+}
+
+function addOption(id, text) {
+  return updateGame((g) => {
+    if (g.phase !== 'options') throw new UserError('Option entry is closed.');
+    if (!text) throw new UserError('Type an option first.');
+    if (text.length > 60) throw new UserError('Keep options under 60 characters.');
+    if (g.options.some((o) => o.text.toLowerCase() === text.toLowerCase())) throw new UserError(`"${text}" is already an option.`);
+    g.options.push({ id, text });
+  });
+}
+
+function removeOption(id) {
+  return updateGame((g) => {
+    if (g.phase !== 'options') throw new UserError('Option entry is closed.');
+    g.options = g.options.filter((o) => o.id !== id);
+  });
+}
+
+function startElimination() {
+  return updateGame((g) => {
+    if (g.options.length < 2) throw new UserError('Need at least 2 options.');
+    g.order = shuffle(g.players.map((p) => p.id)); // randomized once, then fixed
+    g.turn = 0;
+    g.phase = 'eliminate';
+  });
+}
+
+function eliminate(optionId, expectedTurn) {
+  return updateGame((g) => {
+    if (g.phase !== 'eliminate' || g.turn !== expectedTurn) throw new UserError('Someone else just played. Try again.');
+    const cur = currentPlayer(g);
+    if (cur.device !== S.clientId && g.host !== S.clientId) throw new UserError(`It's ${cur.name}'s turn.`);
+    if (!g.options.some((o) => o.id === optionId)) throw new UserError('That option is already gone.');
+    g.options = g.options.filter((o) => o.id !== optionId);
+    if (g.options.length === 1) {
+      g.phase = 'winner';
+      g.winner = g.options[0].text;
+    } else {
+      g.turn = (g.turn + 1) % g.order.length;
+    }
+  });
+}
+
+function playAgain() {
+  return updateGame((g) => {
+    Object.assign(g, { phase: 'lobby', options: [], order: [], turn: 0, winner: null });
+  });
+}
+
+async function endGame() {
+  const code = S.route.code;
+  await updateGame(() => null);
+  if (S.family && S.family.activeGame === code) {
+    await updateFamily((f) => { if (f.activeGame === code) f.activeGame = null; });
+  }
+  goBack();
+}
+
+/* =====================================================================
+   UI event handlers
+   ===================================================================== */
+
+async function onMemberTap(id) {
+  const members = S.family.members;
+  const index = members.findIndex((m) => m.id === id);
+  if (index < 0) return;
+  const m = members[index];
+
+  if (S.mode === 'delete') {
+    const ok = await confirmDialog({
+      title: 'Remove person',
+      message: `Remove ${m.name}? Their statistics will be deleted too.`,
+      ok: 'Remove',
+      danger: true,
+    });
+    if (ok) run(() => removeMember(id));
+  } else if (S.mode === 'edit') {
+    const name = await promptDialog({
+      title: 'Edit name',
+      value: m.name,
+      validate: (n) => nameError(n, S.family.members.filter((x) => x.id !== id).map((x) => x.name)),
+    });
+    if (name && name !== m.name) run(() => renameMember(id, name));
+  } else if (index === 0) {
+    run(() => decide(id));
+  } else {
+    const above = members.slice(0, index).map((x) => x.name);
+    const ok = await confirmDialog({
+      title: 'Confirm decision',
+      message: `${listJoin(above)} deferred their turn. ${m.name} decides?`,
+      ok: 'Confirm',
+    });
+    if (ok) run(() => decide(id));
+  }
+}
+
+async function addMemberDialog() {
+  const name = await promptDialog({
+    title: 'Add family member',
+    ok: 'Add',
+    validate: (n) => nameError(n, S.family.members.map((m) => m.name)),
+  });
+  if (name) run(() => addMember(name));
+}
+
+function setMode(mode) {
+  S.mode = mode;
+  render();
+}
+
+async function openGame() {
+  const active = S.family.activeGame;
+  if (active) {
+    const choice = await choiceDialog({
+      title: 'A game is already running',
+      message: 'Join it, or start a new one?',
+      choices: [{ label: 'Start new', value: 'new' }, { label: 'Join', value: 'join', primary: true }],
+    });
+    if (choice === 'join') { navigate('#/game/' + active); return; }
+    if (choice !== 'new') return;
+  }
+  run(createGame);
+}
+
+async function onEliminate(option, turn) {
+  const g = S.game;
+  const cur = currentPlayer(g);
+  const forOther = cur.device !== S.clientId;
+  const ok = await confirmDialog({
+    title: `Eliminate "${option.text}"?`,
+    message: forOther ? `You're playing this turn for ${cur.name}.` : null,
+    ok: 'Eliminate',
+    danger: true,
+  });
+  if (ok) run(() => eliminate(option.id, turn));
+}
+
+function familyDialog() {
+  const code = S.familyCode;
+  openModal((close) => [
+    h('h2', {}, 'Your family'),
+    h('div', { class: 'muted small center' }, 'Family code'),
+    h('div', { class: 'big-code' }, code),
+    h('p', { class: 'muted small' }, S.store.mode === 'local'
+      ? "Demo mode: other phones can't join until Firebase is set up (see README)."
+      : 'On another phone, open this app and enter this code, or send them the invite link.'),
+    h('div', { class: 'stack' },
+      h('button', {
+        class: 'btn primary',
+        onClick: () => shareLink('Family Decision Maker', `Join our family in Family Decision Maker (code ${code})`, inviteUrl(code)),
+      }, '📤 Share invite link'),
+      h('button', {
+        class: 'btn text',
+        onClick: async () => {
+          close();
+          const ok = await confirmDialog({
+            title: 'Leave family on this phone?',
+            message: `This phone will stop showing the family. Nobody else is affected, and you can rejoin any time with code ${code}.`,
+            ok: 'Leave',
+          });
+          if (ok) leaveFamily();
+        },
+      }, 'Leave family on this phone')),
+    h('div', { class: 'dialog-actions' }, h('button', { class: 'btn', onClick: () => close() }, 'Close')),
+  ]);
+}
+
+/* =====================================================================
+   Views
+   ===================================================================== */
+
+function appBar(title, { back = false, actions = [] } = {}) {
+  return h('header', { class: 'appbar' },
+    back && h('button', { class: 'icon-btn', 'aria-label': 'Back', onClick: goBack }, '←'),
+    h('h1', {}, title),
+    actions);
+}
+
+function demoBanner() {
+  if (!S.store || S.store.mode !== 'local') return null;
+  return h('div', { class: 'banner demo', id: 'demo-banner' },
+    h('span', {}, '🧪'),
+    h('span', { class: 'grow small' },
+      h('strong', {}, 'Demo mode. '),
+      "Firebase isn't connected yet, so everything stays in this browser. Open a second tab to act as another phone."));
+}
+
+function loadingView(key = 'loading') {
+  return h('div', { class: 'screen', 'data-key': key },
+    h('div', { class: 'center-fill' }, h('div', { class: 'spinner', 'aria-label': 'Loading' })));
+}
+
+function messageView(key, title, message, buttonLabel, onClick) {
+  return h('div', { class: 'screen', 'data-key': key },
+    appBar('Family Decision Maker'),
+    h('main', { class: 'content' },
+      h('section', { class: 'card' },
+        h('h2', {}, title),
+        h('p', { class: 'muted' }, message),
+        buttonLabel && h('button', { class: 'btn primary', onClick }, buttonLabel))));
+}
+
+function codeForm(id, label, onCode) {
+  return h('form', {
+    class: 'row',
+    onSubmit: (e) => {
+      e.preventDefault();
+      const c = normCode(document.getElementById(id).value);
+      if (c.length < 4) { toast('Enter the code.'); return; }
+      run(() => onCode(c));
+    },
+  },
+  h('input', { id, class: 'input code-input', placeholder: 'Code', maxlength: 8, autocomplete: 'off', autocapitalize: 'characters', spellcheck: 'false', 'aria-label': 'Code' }),
+  h('button', { class: 'btn', type: 'submit' }, label));
+}
+
+function welcomeView() {
+  const names = S.draftNames;
+  const addDraft = (e) => {
+    e.preventDefault();
+    const input = document.getElementById('new-name');
+    const n = input.value.trim();
+    const err = nameError(n, names);
+    if (err) { toast(err); return; }
+    names.push(n);
+    input.value = '';
+    render();
+    input.focus();
+  };
+
+  return h('div', { class: 'screen', 'data-key': 'welcome' },
+    appBar('Family Decision Maker'),
+    h('main', { class: 'content' },
+      demoBanner(),
+      h('p', { class: 'muted' }, "The decision making methods our family finds most useful, on everyone's phone."),
+
+      h('section', { class: 'card' },
+        h('h2', {}, 'Start a new family'),
+        h('p', { class: 'muted small' }, "Who's in your family? Add everyone in the order you want them to take turns deciding."),
+        h('form', { class: 'row', onSubmit: addDraft },
+          h('input', { id: 'new-name', class: 'input', placeholder: 'Name', maxlength: 30, autocomplete: 'off', 'aria-label': 'Name' }),
+          h('button', { class: 'btn', type: 'submit' }, 'Add')),
+        names.length > 0 && h('ol', { class: 'chips', id: 'draft-names' },
+          names.map((n, i) => h('li', { class: 'chip', 'data-key': 'd-' + n },
+            `${i + 1}. ${n}`,
+            h('button', { class: 'x', type: 'button', 'aria-label': `Remove ${n}`, onClick: () => { names.splice(i, 1); render(); } }, '×')))),
+        h('button', {
+          class: 'btn primary block',
+          id: 'create-family',
+          disabled: names.length === 0,
+          onClick: () => run(() => createFamily([...names])),
+        }, names.length ? `Create family (${names.length})` : 'Create family')),
+
+      h('section', { class: 'card' },
+        h('h2', {}, 'Join your family'),
+        h('p', { class: 'muted small' }, 'Already set up on another phone? Enter the family code shown there under 👪.'),
+        codeForm('join-family-code', 'Join', joinFamily)),
+
+      h('section', { class: 'card' },
+        h('h2', {}, 'Join a game'),
+        h('p', { class: 'muted small' }, "Joining someone's Elimination Game? Enter the game code."),
+        codeForm('join-game-code', 'Join game', (c) => navigate('#/game/' + c)))));
+}
+
+function joinInviteView() {
+  const code = S.route.code;
+  return h('div', { class: 'screen', 'data-key': 'invite' },
+    appBar('Family Decision Maker'),
+    h('main', { class: 'content' },
+      h('section', { class: 'card' },
+        h('h2', {}, "You've been invited to a family"),
+        h('div', { class: 'big-code' }, code),
+        S.familyCode && h('p', { class: 'muted small' }, `This phone is currently in family ${S.familyCode}. Joining will switch to the new family.`),
+        h('div', { class: 'dialog-actions' },
+          h('button', { class: 'btn text', onClick: () => location.replace('#/') }, 'Cancel'),
+          h('button', { class: 'btn primary', onClick: () => run(() => joinFamily(code)) }, 'Join family')))));
+}
+
+function tool(icon, label, onClick, disabled = false) {
+  return h('button', { class: 'tool', onClick, disabled, 'aria-label': label },
+    h('span', { class: 'tool-icon' }, icon), h('span', {}, label));
+}
+
+function bottomBar() {
+  if (S.mode !== 'normal') {
+    const del = S.mode === 'delete';
+    return h('footer', { class: 'bottombar', id: 'bottombar' },
+      h('div', { class: `modebar ${S.mode}` },
+        h('div', { class: 'grow' },
+          h('strong', {}, del ? 'DELETE MODE' : 'EDIT MODE'),
+          h('div', { class: 'muted small' }, del ? 'Tap a person to remove them' : 'Tap a person to rename them')),
+        h('button', { class: 'btn primary', onClick: () => setMode('normal') }, 'Done')));
+  }
+  const empty = S.family.members.length === 0;
+  return h('footer', { class: 'bottombar', id: 'bottombar' },
+    h('div', { class: 'tools' },
+      tool('➕', 'Add', addMemberDialog),
+      tool('🗑️', 'Delete', () => setMode('delete'), empty),
+      tool('✏️', 'Edit', () => setMode('edit'), empty)),
+    h('button', { class: 'btn primary block big', onClick: openGame }, '🎲 Elimination Game'));
+}
+
+function homeView() {
+  const f = S.family;
+  const members = f.members;
+  const mode = S.mode;
+
+  return h('div', { class: `screen mode-${mode}`, 'data-key': 'home' },
+    appBar('Who decides?', {
+      actions: [
+        h('button', { class: 'icon-btn', 'aria-label': 'Statistics', title: 'Statistics', onClick: () => navigate('#/stats') }, '📊'),
+        h('button', { class: 'icon-btn', 'aria-label': 'Family and invite', title: 'Family and invite', onClick: familyDialog }, '👪'),
+      ],
+    }),
+    h('main', { class: 'content' },
+      demoBanner(),
+      f.activeGame && mode === 'normal' && h('div', { class: 'banner', id: 'game-banner' },
+        h('span', {}, '🎲'),
+        h('span', { class: 'grow' }, 'An Elimination Game is in progress.'),
+        h('button', { class: 'btn primary', onClick: () => navigate('#/game/' + f.activeGame) }, 'Join')),
+      members.length === 0
+        ? h('section', { class: 'card center', id: 'empty' },
+          h('div', { class: 'emoji-xl' }, '👪'),
+          h('p', { class: 'muted' }, 'Nobody is in the list yet.'),
+          h('button', { class: 'btn primary', onClick: addMemberDialog }, 'Add a person'))
+        : [
+          h('ol', { class: 'plist', id: 'plist' },
+            members.map((m, i) => h('li', { 'data-key': 'm-' + m.id },
+              h('button', { class: 'person' + (i === 0 ? ' first' : ''), onClick: () => onMemberTap(m.id) },
+                h('span', { class: 'pos' }, i + 1),
+                h('span', { class: 'name' }, m.name),
+                i === 0 && h('span', { class: 'crown', title: 'Decides next' }, '👑'),
+                mode !== 'normal' && h('span', { class: 'mode-icon' }, mode === 'delete' ? '🗑️' : '✏️'))))),
+          mode === 'normal' && h('p', { class: 'muted small center hint', id: 'hint' },
+            members.length > 1
+              ? 'Tap the person who made a decision. They move to the bottom.'
+              : 'Add more people with ➕.'),
+        ]),
+    bottomBar());
+}
+
+function statsView() {
+  const members = S.family.members;
+  const total = members.reduce((s, m) => s + (m.decisions || 0), 0);
+  const max = Math.max(1, ...members.map((m) => m.decisions || 0));
+
+  return h('div', { class: 'screen', 'data-key': 'stats' },
+    appBar('Statistics', { back: true }),
+    h('main', { class: 'content' },
+      h('section', { class: 'card center' },
+        h('div', { class: 'stat-total' }, total),
+        h('div', { class: 'muted small' }, total === 1 ? 'decision made' : 'decisions made')),
+      members.length === 0 && h('p', { class: 'muted center' }, 'No statistics yet.'),
+      members.map((m) => {
+        const entries = Object.entries(m.positions || {}).sort((a, b) => Number(a[0]) - Number(b[0]));
+        return h('section', { class: 'card', 'data-key': 's-' + m.id },
+          h('div', { class: 'row' },
+            h('h2', { class: 'grow' }, m.name),
+            h('strong', {}, `${m.decisions || 0} ${m.decisions === 1 ? 'decision' : 'decisions'}`)),
+          h('div', { class: 'bar' }, h('div', { class: 'bar-fill', style: `width:${((m.decisions || 0) / max) * 100}%` })),
+          entries.length
+            ? [h('div', { class: 'muted small' }, 'Position in the list when they decided:'),
+              h('div', { class: 'chips' }, entries.map(([pos, n]) => h('span', { class: 'chip' }, `#${pos}: ${n}`)))]
+            : h('div', { class: 'muted small' }, 'No decisions yet.'));
+      })));
+}
+
+/* ---------- Elimination Game views ---------- */
+
+function gameView() {
+  const code = S.route.code;
+  const g = S.game;
+  if (!S.store || g === undefined) return loadingView('game-loading');
+  if (g === null) {
+    return messageView('game-ended', 'This game has ended',
+      `There's no game with code ${code} any more. It may have been ended by the host.`,
+      'Back to home', goBack);
+  }
+  const isHost = g.host === S.clientId;
+  const titles = { lobby: 'Players', options: 'Add options', eliminate: 'Eliminate', winner: 'Decision made!' };
+  const body = {
+    lobby: lobbyPhase, options: optionsPhase, eliminate: eliminatePhase, winner: winnerPhase,
+  }[g.phase](g, isHost);
+
+  return h('div', { class: 'screen', 'data-key': `game-${code}-${g.phase}` },
+    appBar('🎲 ' + titles[g.phase], {
+      back: true,
+      actions: [h('span', { class: 'tag code-tag', title: 'Game code' }, code)],
+    }),
+    h('main', { class: 'content' }, demoBanner(), body));
+}
+
+function lobbyPhase(g, isHost) {
+  const taken = new Set(g.players.map((p) => p.name.toLowerCase()));
+  const suggestions = (g.familyNames || []).filter((n) => !taken.has(n.toLowerCase()));
+  const mine = g.players.filter((p) => p.device === S.clientId);
+  const code = S.route.code;
+
+  const submitName = (e) => {
+    e.preventDefault();
+    const input = document.getElementById('player-name');
+    const n = input.value.trim();
+    if (!n) return;
+    run(() => addPlayer(n)).then((ok) => { if (ok) input.value = ''; });
+  };
+
+  return [
+    h('section', { class: 'card center', id: 'code-card' },
+      h('div', { class: 'muted small' }, 'Game code'),
+      h('div', { class: 'big-code' }, code),
+      h('p', { class: 'muted small' }, 'Others join with this code, or from the banner on their home screen.'),
+      h('button', { class: 'btn', onClick: () => shareLink('Elimination Game', `Join our Elimination Game (code ${code})`, gameUrl(code)) }, '📤 Share game link')),
+
+    h('section', { class: 'card', id: 'players-card' },
+      h('h2', {}, `Players (${g.players.length})`),
+      g.players.length === 0
+        ? h('p', { class: 'muted small' }, 'No players yet.')
+        : h('ul', { class: 'list' }, g.players.map((p) => h('li', { 'data-key': 'p-' + p.id },
+          h('span', { class: 'grow' }, p.name),
+          p.device === S.clientId && h('span', { class: 'tag' }, 'this phone'),
+          (p.device === S.clientId || isHost) && h('button', {
+            class: 'icon-btn sm', 'aria-label': `Remove ${p.name}`, onClick: () => run(() => removePlayer(p.id)),
+          }, '×'))))),
+
+    h('section', { class: 'card', id: 'add-player-card' },
+      h('h2', {}, mine.length ? 'Add more players on this phone' : 'Who is playing on this phone?'),
+      h('p', { class: 'muted small' }, 'Tap your name. If several people share this phone, add each of them.'),
+      suggestions.length > 0 && h('div', { class: 'chips' },
+        suggestions.map((n) => h('button', { class: 'chip', 'data-key': 's-' + n, onClick: () => run(() => addPlayer(n)) }, '+ ' + n))),
+      h('form', { class: 'row', onSubmit: submitName },
+        h('input', { id: 'player-name', class: 'input', placeholder: 'Another name', maxlength: 30, autocomplete: 'off', 'aria-label': 'Player name' }),
+        h('button', { class: 'btn', type: 'submit' }, 'Add'))),
+
+    isHost
+      ? h('button', { class: 'btn primary block big', id: 'to-options', disabled: g.players.length < 2, onClick: () => run(toOptions) },
+        g.players.length < 2 ? 'Need at least 2 players' : 'Next: add options →')
+      : h('p', { class: 'center muted' }, 'Waiting for the host to continue…'),
+  ];
+}
+
+function optionsPhase(g, isHost) {
+  const submitOption = (e) => {
+    e.preventDefault();
+    const input = document.getElementById('option-input');
+    const text = input.value.trim();
+    if (!text) return;
+    const id = uid();
+    input.value = ''; // clear right away so the next option can be typed
+    run(async () => {
+      await addOption(id, text);
+      S.myOptionIds.add(id);
+    }).then((ok) => { if (!ok && !input.value) input.value = text; });
+  };
+
+  return [
+    h('section', { class: 'card', id: 'option-entry' },
+      h('p', { class: 'muted small' }, 'Everyone can add options from their own phone, as many as they like. Nobody can see who suggested what.'),
+      h('form', { class: 'row', onSubmit: submitOption },
+        h('input', { id: 'option-input', class: 'input', placeholder: 'Add an option', maxlength: 60, autocomplete: 'off', 'aria-label': 'Option' }),
+        h('button', { class: 'btn', type: 'submit' }, 'Add'))),
+
+    h('section', { class: 'card', id: 'options-card' },
+      h('h2', {}, `Options (${g.options.length})`),
+      g.options.length === 0
+        ? h('p', { class: 'muted small' }, 'No options yet.')
+        : h('ul', { class: 'list' }, g.options.map((o) => h('li', { 'data-key': 'o-' + o.id },
+          h('span', { class: 'grow' }, o.text),
+          S.myOptionIds.has(o.id) && h('button', {
+            class: 'icon-btn sm', 'aria-label': `Remove ${o.text}`, title: 'Remove (you added this)', onClick: () => run(() => removeOption(o.id)),
+          }, '×'))))),
+
+    h('p', { class: 'muted small' }, 'Playing: ' + g.players.map((p) => p.name).join(', ')),
+
+    isHost
+      ? h('div', { class: 'stack', id: 'host-controls' },
+        h('button', { class: 'btn primary block big', id: 'start-elimination', disabled: g.options.length < 2, onClick: () => run(startElimination) },
+          g.options.length < 2 ? 'Need at least 2 options' : 'Start elimination →'),
+        h('button', { class: 'btn text', onClick: () => run(backToLobby) }, '← Back to players'))
+      : h('p', { class: 'center muted' }, 'When everyone is done, the host starts the elimination.'),
+  ];
+}
+
+function eliminatePhase(g, isHost) {
+  const cur = currentPlayer(g);
+  const mine = cur.device === S.clientId;
+  const canAct = mine || isHost;
+
+  return [
+    h('div', { class: 'turn-banner' + (mine ? ' mine' : ''), id: 'turn-banner' },
+      mine
+        ? [h('strong', {}, `${cur.name}, it's your turn!`), h('div', { class: 'small' }, 'Tap an option to eliminate it.')]
+        : [h('strong', {}, `Waiting for ${cur.name}…`),
+          isHost && h('div', { class: 'small' }, "As the host you can tap for them if they're stuck.")]),
+
+    h('section', { class: 'card', id: 'order-card' },
+      h('div', { class: 'muted small' }, 'Turn order'),
+      h('ol', { class: 'chips' }, g.order.map((id, i) => {
+        const p = playerById(g, id);
+        return h('li', { class: 'chip' + (i === g.turn ? ' current' : ''), 'data-key': 't-' + id }, p ? p.name : '?');
+      }))),
+
+    h('p', { class: 'muted small', id: 'left-count' }, `${g.options.length} options left`),
+
+    h('div', { id: 'options' }, g.options.map((o) => h('button', {
+      class: 'option-btn', 'data-key': 'o-' + o.id, disabled: !canAct, onClick: () => onEliminate(o, g.turn),
+    }, h('span', { class: 'grow' }, o.text), h('span', { class: 'x', 'aria-hidden': 'true' }, '✕')))),
+  ];
+}
+
+function winnerPhase(g, isHost) {
+  return h('div', { class: 'winner', id: 'winner' },
+    h('div', { class: 'emoji-xl' }, '🎉'),
+    h('div', { class: 'muted' }, 'The winner is'),
+    h('div', { class: 'winner-name' }, g.winner),
+    isHost
+      ? h('div', { class: 'stack' },
+        h('button', { class: 'btn primary big', onClick: () => run(playAgain) }, 'Play again'),
+        h('button', { class: 'btn', onClick: () => run(endGame) }, 'End game and go home'))
+      : h('div', { class: 'stack' },
+        h('p', { class: 'muted small' }, 'The host can start another round.'),
+        h('button', { class: 'btn', onClick: goBack }, 'Back to home')));
+}
+
+/* ---------- top-level render ---------- */
+
+function currentView() {
+  if (S.storeError) {
+    return messageView('error', "Couldn't connect", S.storeError,
+      'Try again', () => location.reload());
+  }
+  if (!S.store) return loadingView();
+  const r = S.route;
+  if (r.name === 'game') return gameView();
+  if (r.name === 'joinFamily') return joinInviteView();
+  if (!S.familyCode) return welcomeView();
+  if (S.family === undefined) return loadingView();
+  if (S.family === null) {
+    return messageView('family-missing', 'Family not found',
+      `The family with code ${S.familyCode} no longer exists.`, 'Start over', leaveFamily);
+  }
+  if (r.name === 'stats') return statsView();
+  return homeView();
+}
+
+function render() {
+  patchChildren($app, [currentView()]);
+}
+
+async function main() {
+  try {
+    S.store = await createStore();
+  } catch (e) {
+    console.error(e);
+    S.storeError = `Could not connect to Firebase (${e.message || e}). Check js/firebase-config.js and that Anonymous sign-in is enabled. See the README.`;
+    render();
+    return;
+  }
+  S.clientId = getClientId(S.store.mode);
+  if (S.route.name === 'joinFamily' && S.route.code === S.familyCode) location.replace('#/');
+  syncSubscriptions();
+  render();
+}
+
+main();

@@ -1,0 +1,11 @@
+{
+  "name": "Family Decision Maker",
+  "short_name": "Decide",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#f6f4fb",
+  "theme_color": "#5b3cc4",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
