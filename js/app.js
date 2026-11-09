@@ -1269,6 +1269,8 @@ function openFinder() {
 }
 
 function closeFinder() {
+  clearTimeout(searchTimer);
+  if (searchAbort) searchAbort.abort();
   S.finder = null;
   render();
 }
@@ -1316,22 +1318,50 @@ function setFinderLocation(loc) {
   runSearch();
 }
 
-async function runSearch() {
+// Results already fetched in this session, so flipping back to a type or
+// distance doesn't search again (and doesn't use up the map server's limit).
+const placeCache = new Map();
+let searchTimer = null;
+let searchAbort = null;
+
+function runSearch() {
   const f = S.finder;
   if (!f) return;
   if (f.cat === 'movies') { loadMovies(); return; }
   if (!f.loc) { render(); return; }
-  const req = ++f.req;
-  Object.assign(f, { loading: true, error: null, results: null });
+  const key = `${f.cat}|${f.sub}|${f.radius}|${f.loc.lat.toFixed(4)},${f.loc.lon.toFixed(4)}`;
+  clearTimeout(searchTimer);
+  if (searchAbort) searchAbort.abort(); // cancel a search that's still running
+  if (placeCache.has(key)) {
+    Object.assign(f, { loading: false, error: null, errorDetail: null, results: placeCache.get(key) });
+    render();
+    return;
+  }
+  Object.assign(f, { loading: true, slow: false, error: null, errorDetail: null, results: null });
   render();
+  // Wait for taps to settle so quick changes become a single search.
+  searchTimer = setTimeout(() => doSearch(f, key), 500);
+}
+
+async function doSearch(f, key) {
+  const req = ++f.req;
+  const ctrl = new AbortController();
+  searchAbort = ctrl;
+  const slowTimer = setTimeout(() => { if (S.finder === f && req === f.req) { f.slow = true; render(); } }, 6000);
   try {
-    const results = await searchPlaces(f.cat, f.sub, f.loc, RADII[f.radius]);
+    const results = await searchPlaces(f.cat, f.sub, f.loc, RADII[f.radius], ctrl.signal);
+    placeCache.set(key, results);
     if (S.finder !== f || req !== f.req) return;
     f.results = results;
   } catch (e) {
-    console.error(e);
+    if (e.name === 'AbortError') return; // replaced by a newer search
+    console.warn(e);
     if (S.finder !== f || req !== f.req) return;
     f.error = 'The map service is busy or unreachable. Try again in a moment.';
+    f.errorDetail = e.reasons ? e.reasons.join(' · ') : String(e.message || e);
+  } finally {
+    clearTimeout(slowTimer);
+    if (searchAbort === ctrl) searchAbort = null;
   }
   f.loading = false;
   render();
@@ -1405,9 +1435,13 @@ function locationRow(f) {
 }
 
 function finderStatus(f, emptyText) {
-  if (f.loading) return h('div', { class: 'finder-status center' }, h('div', { class: 'spinner inline' }), h('p', { class: 'muted small' }, 'Searching…'));
+  if (f.loading) {
+    return h('div', { class: 'finder-status center' }, h('div', { class: 'spinner inline' }),
+      h('p', { class: 'muted small' }, f.slow ? 'Still searching… the free map service is slow right now.' : 'Searching…'));
+  }
   if (f.error) {
     return h('div', { class: 'finder-status' }, h('p', { class: 'error-text' }, f.error),
+      f.errorDetail && h('p', { class: 'muted small', id: 'error-detail' }, `Details: ${f.errorDetail}`),
       (f.loc || f.cat === 'movies') && h('button', { class: 'btn', onClick: () => { f.movies = null; runSearch(); } }, 'Try again'));
   }
   return emptyText ? h('p', { class: 'muted finder-status' }, emptyText) : null;

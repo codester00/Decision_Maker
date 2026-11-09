@@ -66,10 +66,14 @@ export const CATEGORIES = {
   movies: { label: 'Movies', icon: '🎬', subs: [] },
 };
 
-// "Any" for activities = every activity sub-category.
+// "Any" activity, kept to three lookups so it stays quick for the server.
 CATEGORIES.activities.subs.unshift({
   id: 'any', label: 'Any',
-  q: CATEGORIES.activities.subs.flatMap((s) => s.q),
+  q: [
+    '["leisure"~"^(park|playground|bowling_alley|miniature_golf|amusement_arcade|trampoline_park|escape_game|water_park|ice_rink)$"]',
+    '["tourism"~"^(museum|gallery|zoo|aquarium|theme_park|attraction)$"]',
+    '["amenity"~"^(cinema|library)$"]',
+  ],
 });
 
 /* ---------- distance ---------- */
@@ -92,7 +96,13 @@ export function formatDistance(km) {
 
 /* ---------- OpenStreetMap ---------- */
 
-const OVERPASS = ['https://overpass-api.de/api/interpreter', 'https://overpass.private.coffee/api/interpreter'];
+// Public Overpass servers, tried in order. The main one allows each internet
+// connection only a couple of searches at a time and says "429" when busy.
+const OVERPASS = [
+  { url: 'https://overpass-api.de/api/interpreter', name: 'main server' },
+  { url: 'https://maps.mail.ru/osm/tools/overpass/api/interpreter', name: 'backup server 1' },
+  { url: 'https://overpass.private.coffee/api/interpreter', name: 'backup server 2' },
+];
 
 export function buildQuery(selectors, lat, lon, radius) {
   const meters = Math.round(radius * UNIT_KM * 1000);
@@ -100,30 +110,76 @@ export function buildQuery(selectors, lat, lon, radius) {
   return `[out:json][timeout:25];(${parts});out center tags 400;`;
 }
 
-async function fetchWithTimeout(url, options = {}, ms = 30000) {
+class Timeout extends Error {}
+
+// fetch with a time limit; also stops early if `outer` (the caller's signal) aborts.
+async function fetchWithTimeout(url, options = {}, ms = 30000, outer = null) {
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), ms);
+  let timedOut = false;
+  const t = setTimeout(() => { timedOut = true; ctrl.abort(); }, ms);
+  const onOuter = () => ctrl.abort();
+  if (outer) outer.addEventListener('abort', onOuter);
   try {
     return await fetch(url, { ...options, signal: ctrl.signal });
+  } catch (e) {
+    if (timedOut) throw new Timeout('timed out');
+    throw e;
   } finally {
     clearTimeout(t);
+    if (outer) outer.removeEventListener('abort', onOuter);
   }
 }
 
-export async function searchPlaces(catId, subId, loc, radius) {
+const wait = (ms, signal) => new Promise((resolve, reject) => {
+  const t = setTimeout(resolve, ms);
+  if (signal) signal.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('Aborted', 'AbortError')); }, { once: true });
+});
+
+function reasonFor(e, res) {
+  if (res && res.status === 429) return 'too many searches right now';
+  if (res && res.status === 504) return 'overloaded';
+  if (res) return `error ${res.status}`;
+  if (e instanceof Timeout) return 'took too long';
+  return "couldn't connect";
+}
+
+export class SearchError extends Error {
+  constructor(reasons) { super(reasons.join('; ')); this.reasons = reasons; }
+}
+
+// Throws SearchError (with a reason per server) if every server fails, or an
+// AbortError if `signal` is aborted because a newer search replaced this one.
+export async function searchPlaces(catId, subId, loc, radius, signal = null) {
   const sub = CATEGORIES[catId].subs.find((s) => s.id === subId) || CATEGORIES[catId].subs[0];
   const body = 'data=' + encodeURIComponent(buildQuery(sub.q, loc.lat, loc.lon, radius));
-  let lastErr;
-  for (const url of OVERPASS) {
-    try {
-      const res = await fetchWithTimeout(url, { method: 'POST', body, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return parsePlaces(await res.json(), loc);
-    } catch (e) {
-      lastErr = e;
+  const reasons = [];
+  for (const [i, server] of OVERPASS.entries()) {
+    // The main server usually frees up within a few seconds, so give it a second try.
+    for (let attempt = 0; attempt < (i === 0 ? 2 : 1); attempt++) {
+      let res = null;
+      try {
+        res = await fetchWithTimeout(server.url, {
+          method: 'POST', body, headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        }, 20000, signal);
+        if (res.ok) {
+          const json = await res.json();
+          if (json.remark && /runtime error/i.test(json.remark) && !(json.elements || []).length) throw new Error(json.remark);
+          return parsePlaces(json, loc);
+        }
+        throw new Error(`HTTP ${res.status}`);
+      } catch (e) {
+        if (e.name === 'AbortError' && signal && signal.aborted) throw e;
+        const why = reasonFor(e, res);
+        if (i === 0 && attempt === 0 && res && (res.status === 429 || res.status === 504)) {
+          await wait(4000, signal);
+          continue;
+        }
+        reasons.push(`${server.name}: ${why}`);
+        break;
+      }
     }
   }
-  throw lastErr;
+  throw new SearchError(reasons);
 }
 
 const pretty = (s) => s.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
