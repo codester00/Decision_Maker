@@ -1333,7 +1333,7 @@ function runSearch() {
   clearTimeout(searchTimer);
   if (searchAbort) searchAbort.abort(); // cancel a search that's still running
   if (placeCache.has(key)) {
-    Object.assign(f, { loading: false, error: null, errorDetail: null, results: placeCache.get(key) });
+    Object.assign(f, { loading: false, error: null, errorDetail: null, ...placeCache.get(key) });
     render();
     return;
   }
@@ -1349,10 +1349,11 @@ async function doSearch(f, key) {
   searchAbort = ctrl;
   const slowTimer = setTimeout(() => { if (S.finder === f && req === f.req) { f.slow = true; render(); } }, 6000);
   try {
-    const results = await searchPlaces(f.cat, f.sub, f.loc, RADII[f.radius], ctrl.signal);
-    placeCache.set(key, results);
+    const { results, limited } = await searchPlaces(f.cat, f.sub, f.loc, RADII[f.radius], ctrl.signal);
+    // Only remember full results; a fallback answer is worth retrying later.
+    if (!limited) placeCache.set(key, { results, limited });
     if (S.finder !== f || req !== f.req) return;
-    f.results = results;
+    Object.assign(f, { results, limited });
   } catch (e) {
     if (e.name === 'AbortError') return; // replaced by a newer search
     console.warn(e);
@@ -1474,6 +1475,8 @@ function placesPanel(f, mine) {
       onClick: () => { if (i !== f.radius) setFinder({ radius: i }); },
     }, `${r} ${unitLabel}`)))),
     f.loc && status,
+    f.limited && f.results && !f.loading && h('p', { class: 'muted small', id: 'limited-note' },
+      'ℹ️ The main map service is down, so these come from a simpler search and may be incomplete. Search again later for the full list.'),
     f.results && f.results.length > 0 && !f.loading && h('ul', { class: 'list results', id: 'results' },
       f.results.map((p) => resultRow(p, mine, [p.detail, formatDistance(p.km)].filter(Boolean).join(' · ')))),
     h('p', { class: 'muted small attribution' }, 'Place data © OpenStreetMap contributors'),

@@ -9,6 +9,7 @@ import { tmdbKey } from './api-keys.js';
    have a name. Cuisine values in OpenStreetMap look like "pizza;italian". */
 
 const FOOD = '["amenity"~"^(restaurant|fast_food)$"]';
+const CUISINE_RE = {};
 const cuisine = (re) => `${FOOD}["cuisine"~"${re}",i]`;
 
 export const CATEGORIES = {
@@ -76,6 +77,23 @@ CATEGORIES.activities.subs.unshift({
   ],
 });
 
+/* Fallback search (Nominatim) when the Overpass servers are down: search
+   phrases per sub-category, plus a client-side cuisine filter for food.
+   Nominatim returns at most 50 results per phrase and allows ~1 request/s. */
+const NOMINATIM_PHRASES = {
+  food: { any: ['restaurant', 'fast food'], fastfood: ['fast food'], dessert: ['ice cream', 'cafe'] },
+  activities: {
+    any: ['museum', 'park', 'cinema'], parks: ['park', 'playground'], museums: ['museum'], zoos: ['zoo', 'aquarium'],
+    bowling: ['bowling alley'], minigolf: ['miniature golf'], arcades: ['amusement arcade'], trampoline: ['trampoline park'],
+    escape: ['escape room'], swim: ['water park', 'swimming pool'], skating: ['ice rink'], climbing: ['climbing'],
+    themeparks: ['theme park'], cinemas: ['cinema'], libraries: ['library'], sights: ['attraction'],
+  },
+};
+for (const sub of CATEGORIES.food.subs) {
+  const m = sub.q.map((q) => q.match(/\["cuisine"~"([^"]+)"/)).find(Boolean);
+  if (m) CUISINE_RE[sub.id] = new RegExp(m[1], 'i');
+}
+
 /* ---------- distance ---------- */
 
 export const USES_MILES = /^en-(US|GB|LR|MM)/i.test(navigator.language || '');
@@ -96,8 +114,10 @@ export function formatDistance(km) {
 
 /* ---------- OpenStreetMap ---------- */
 
-// Public Overpass servers, tried in order. The main one allows each internet
-// connection only a couple of searches at a time and says "429" when busy.
+// Public Overpass servers. The main one is tried first; it allows each
+// internet connection only a couple of searches at a time ("429" when busy)
+// and is sometimes overloaded ("502"/"504"). If it fails, the backups and the
+// Nominatim fallback are asked at the same time.
 const OVERPASS = [
   { url: 'https://overpass-api.de/api/interpreter', name: 'main server' },
   { url: 'https://maps.mail.ru/osm/tools/overpass/api/interpreter', name: 'backup server 1' },
@@ -147,39 +167,93 @@ export class SearchError extends Error {
   constructor(reasons) { super(reasons.join('; ')); this.reasons = reasons; }
 }
 
-// Throws SearchError (with a reason per server) if every server fails, or an
-// AbortError if `signal` is aborted because a newer search replaced this one.
+async function overpassOnce(server, body, loc, ms, signal) {
+  let res = null;
+  try {
+    res = await fetchWithTimeout(server.url, {
+      method: 'POST', body, headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    }, ms, signal);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    if (json.remark && /runtime error/i.test(json.remark) && !(json.elements || []).length) throw new Error(json.remark);
+    return parsePlaces(json, loc);
+  } catch (e) {
+    if (e.name === 'AbortError' && signal && signal.aborted) throw e;
+    const err = new Error(reasonFor(e, res));
+    err.status = res && res.status;
+    throw err;
+  }
+}
+
+// Resolves to { results, limited }. `limited` means the results came from the
+// simpler Nominatim fallback. Throws SearchError (a reason per server) if
+// everything fails, or an AbortError if a newer search replaced this one.
 export async function searchPlaces(catId, subId, loc, radius, signal = null) {
   const sub = CATEGORIES[catId].subs.find((s) => s.id === subId) || CATEGORIES[catId].subs[0];
   const body = 'data=' + encodeURIComponent(buildQuery(sub.q, loc.lat, loc.lon, radius));
   const reasons = [];
-  for (const [i, server] of OVERPASS.entries()) {
-    // The main server usually frees up within a few seconds, so give it a second try.
-    for (let attempt = 0; attempt < (i === 0 ? 2 : 1); attempt++) {
-      let res = null;
-      try {
-        res = await fetchWithTimeout(server.url, {
-          method: 'POST', body, headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        }, 20000, signal);
-        if (res.ok) {
-          const json = await res.json();
-          if (json.remark && /runtime error/i.test(json.remark) && !(json.elements || []).length) throw new Error(json.remark);
-          return parsePlaces(json, loc);
-        }
-        throw new Error(`HTTP ${res.status}`);
-      } catch (e) {
-        if (e.name === 'AbortError' && signal && signal.aborted) throw e;
-        const why = reasonFor(e, res);
-        if (i === 0 && attempt === 0 && res && (res.status === 429 || res.status === 504)) {
-          await wait(4000, signal);
-          continue;
-        }
-        reasons.push(`${server.name}: ${why}`);
-        break;
-      }
+  const [main, ...backups] = OVERPASS;
+
+  // 1. Main server, with one retry if it's just busy.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      return { results: await overpassOnce(main, body, loc, 12000, signal), limited: false };
+    } catch (e) {
+      if (e.name === 'AbortError') throw e;
+      if (attempt === 0 && e.status === 429) { await wait(3000, signal); continue; }
+      reasons.push(`${main.name}: ${e.message}`);
+      break;
     }
   }
+
+  // 2. Backups and the fallback at the same time; prefer a backup's full results.
+  const fallback = searchNominatim(catId, sub.id, loc, radius, signal).then(
+    (results) => ({ results, limited: true }),
+    (e) => { if (e.name === 'AbortError') throw e; reasons.push(`simple search: ${e.message}`); return null; },
+  );
+  fallback.catch(() => {}); // not awaited if a backup wins; avoid an unhandled rejection warning
+  const backupWin = Promise.any(backups.map((srv) => overpassOnce(srv, body, loc, 10000, signal).catch((e) => {
+    if (e.name !== 'AbortError') reasons.push(`${srv.name}: ${e.message}`);
+    throw e;
+  }))).then((results) => ({ results, limited: false }));
+  backupWin.catch(() => {});
+  // Once the fallback has an answer, give the backups only 3 more seconds.
+  const fallbackSoon = fallback.then((fb) => (fb ? wait(3000, signal).then(() => fb) : new Promise(() => {})));
+  const first = await Promise.race([backupWin, fallbackSoon]).catch(() => null);
+  if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
+  if (first) return first;
+  const fb = await fallback;
+  if (fb) return fb;
   throw new SearchError(reasons);
+}
+
+async function searchNominatim(catId, subId, loc, radius, signal) {
+  const phrases = NOMINATIM_PHRASES[catId][subId] || NOMINATIM_PHRASES[catId].any;
+  const km = radius * UNIT_KM;
+  const dLat = km / 111;
+  const dLon = km / (111 * Math.cos((loc.lat * Math.PI) / 180));
+  const viewbox = [loc.lon - dLon, loc.lat + dLat, loc.lon + dLon, loc.lat - dLat].map((v) => v.toFixed(5)).join(',');
+  const re = catId === 'food' ? CUISINE_RE[subId] : null;
+  const elements = [];
+  for (const [i, phrase] of phrases.entries()) {
+    if (i > 0) await wait(1100, signal); // Nominatim asks for at most one request per second
+    const url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&limit=50&bounded=1&extratags=1'
+      + `&viewbox=${viewbox}&q=${encodeURIComponent(phrase)}`;
+    let res;
+    try {
+      res = await fetchWithTimeout(url, { headers: { Accept: 'application/json' } }, 10000, signal);
+    } catch (e) {
+      if (e.name === 'AbortError' && signal && signal.aborted) throw e;
+      throw new Error(reasonFor(e, null));
+    }
+    if (!res.ok) throw new Error(reasonFor(null, res));
+    for (const r of await res.json()) {
+      const tags = { ...(r.extratags || {}), name: r.name, [r.category]: r.type };
+      if (re && !(re.test(tags.cuisine || '') || re.test(r.name || ''))) continue;
+      elements.push({ type: r.osm_type, id: r.osm_id, lat: Number(r.lat), lon: Number(r.lon), tags });
+    }
+  }
+  return parsePlaces({ elements }, loc).filter((p) => p.km <= km);
 }
 
 const pretty = (s) => s.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
