@@ -18,28 +18,28 @@ A small web app with the decision-making methods our family finds most useful. I
 ### Decide together (🎲)
 Group decisions on everyone's phones. They are completely separate from the priority list: they never change the order or the statistics. **Only one per family runs at a time:** starting one while another is running asks whether to join it or end it for everyone and start fresh.
 
-1. **Players.** Family members tap the banner on their home screen (or enter the game code / open the shared link) and add themselves. One phone can add several people (for example, kids without phones), but each person plays from only one phone. Minimum 2 players.
-2. **Options.** Everyone adds options from their own phone at the same time. You can remove options you added yourself. Nobody can see who suggested what.
+1. **Players.** Family members tap the banner on their home screen (or enter the game code / open the shared link) and add themselves. One phone can add several people (for example, kids without phones), but each person plays from only one phone. Minimum 2 players. **Latecomers can join at any point:** mid-Elimination they go to the end of the turn order; mid-vote they vote in the current round.
+2. **Options.** Everyone adds options from their own phone at the same time. By default **each phone sees only its own options** (plus a count of the others) until the decision starts; the host can switch to showing everyone's, which also lets the host remove any option. When the decision starts, options are shuffled so their order doesn't hint at who added them.
 3. **Method.** The host picks how to decide (everyone sees the choice live) and starts:
 
 | Method | How it works | Host settings |
 | --- | --- | --- |
-| 🎯 Elimination | Players take turns (in a shuffled, fixed order) knocking out one option until one is left. | |
+| 🎯 Elimination | Players take turns (in a shuffled, fixed order) knocking out one option until one is left. Each phone sees the list as it was after its own last turn and only catches up on its next turn, so nobody can tell who knocked out what. | |
 | 🎡 Random pick | The host spins; every phone watches the same spin. | Pick an option, or a person to decide |
 | 🗳️ Vote | Secret vote; most votes wins. | One choice each, or approval (tick all you like) |
 | 💰 Points | Spread your points however you like, all on one option or split. | Points per person (default: one per option); most points on one option |
-| 🥇 Ranked choice | Rank favorites. Each round the option with the fewest first choices is knocked out and those ballots move to their next choice, until one is left. Revealed round by round. | |
+| 🥇 Ranked choice | Rank favorites. Each round the option with the fewest first choices is knocked out and those ballots move to their next choice, until one is left. Options with no first-choice votes all go in round 1, and options tied for last whose combined votes still trail the next option go together. Revealed round by round. | |
 | 🚫 Veto round | Everyone secretly vetoes options; the survivors go to a random pick or a vote. If everything is vetoed, the least-vetoed options survive. | Vetoes per person; then random or vote |
-| 🏆 Bracket | Options face off two at a time, tournament style; everyone votes each match. | |
+| 🏆 Bracket | The whole bracket is shown from the start (with byes if needed). Each round, every voter picks a favorite in **all** of that round's matchups, then passes the phone. | |
 | ⭐ Star rating | Rate every option 0–5 stars; highest total wins. | |
 
 4. **Results.** The winner and the breakdown are shown on every phone. The host can **decide again with the same options** (maybe with another method), **start over**, or **end the game**, which deletes it completely.
 
 **Ties:** for votes, points and stars, the family's 👑 (#1 on the priority list when the game started) breaks the tie if they're playing; otherwise it's random. Ranked choice breaks ties for last place by fewest 2nd-choice votes, then randomly. A tied bracket match is a coin flip.
 
-**If something gets stuck:** the host can close voting early (missing votes aren't counted) and can play an Elimination turn or break a tie for someone. If the host's phone is stuck, any player's phone can **take over as host**.
+**If something gets stuck:** the host can close voting early (missing votes aren't counted), break a tie for someone, or play a stuck player's Elimination turn (which shows the host the current list). If the host's phone is stuck, any player's phone can **take over as host**.
 
-**Privacy:** votes are secret. The app keeps only running totals (and, for ranked choice, unnamed ballots in random order), never who suggested, eliminated or voted for what. Nothing is kept after the host ends the game.
+**Privacy:** votes are secret. The app keeps only running totals (and, for ranked choice, unnamed ballots in random order), never who suggested, eliminated or voted for what. Nothing is kept after the host ends the game. Two limits to know: with very few players, results can still be worked out (with two voters, the totals minus your own vote show the other's), and someone tech-savvy could inspect the shared database while voting is under way. Fixing the second would need a server, which this app doesn't have.
 
 ## Codes and joining
 - Each family has a 6-character **family code** (👪 button). On another phone, open the app and enter the code, or send the **invite link**.

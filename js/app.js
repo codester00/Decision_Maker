@@ -2,7 +2,7 @@ import { createStore, isDemo } from './store.js';
 import {
   METHODS, METHOD_ORDER, BALLOT_METHODS, RuleError, settingsOf, minOptions, pointsEach,
   normalizeGame, startPlay, currentPlayer, eliminate, spin, applyBallot, resolveBallots, breakTie,
-  resetToOptions, resetToLobby, ballotRound,
+  resetToOptions, resetToLobby, ballotRound, openMatches,
 } from './methods.js';
 
 const $app = document.getElementById('app');
@@ -255,7 +255,11 @@ const S = {
   route: parseRoute(),
   mode: 'normal', // normal | delete | edit
   draftNames: [],
-  myOptionIds: new Set(), // only kept in memory, never sent anywhere
+  myOptionIds: new Set(), // options this phone added; kept only on this phone (sessionStorage)
+  elimSnap: null, // Elimination: the option list as of this phone's last turn
+  elimPending: null, // Elimination: option this phone just knocked out (hidden right away)
+  playFor: null, // Elimination: host chose to play a stuck player's turn
+  showAddPlayer: null, // game code where the "add another player" form is open
   ballotFor: null, // which of this phone's players is filling in a ballot
   draft: null, // the ballot being filled in (local until submitted)
   reveal: null, // ranked-choice round reveal progress
@@ -316,7 +320,8 @@ function syncSubscriptions() {
     if (gameSub.off) gameSub.off();
     gameSub = { code: gc, off: null };
     S.game = undefined;
-    S.myOptionIds = new Set();
+    S.myOptionIds = new Set(loadMyOptions(gc));
+    S.elimSnap = null;
     if (gc) {
       gameSub.off = S.store.watch('games', gc, (d) => {
         const prev = S.game;
@@ -324,7 +329,7 @@ function syncSubscriptions() {
         if (d === null && S.family && S.family.activeGame === gc) {
           run(() => updateFamily((f) => { if (f.activeGame === gc) f.activeGame = null; }));
         }
-        const needKey = (x) => x && `${x.phase}:${x.method}:${x.turn}:${x.bracket ? x.bracket.history.length : ''}`;
+        const needKey = (x) => x && `${x.phase}:${x.method}:${x.turn}:${x.bracket ? x.bracket.round : ''}`;
         if (needsMe(S.game) && !(needsMe(prev) && needKey(prev) === needKey(S.game))) {
           if (navigator.vibrate) navigator.vibrate(200);
         }
@@ -332,6 +337,15 @@ function syncSubscriptions() {
       }, onSubError);
     }
   }
+}
+
+function loadMyOptions(code) {
+  try { return code ? JSON.parse(sessionStorage.getItem('fdm:myopts:' + code) || '[]') : []; } catch { return []; }
+}
+
+function rememberMyOption(id) {
+  S.myOptionIds.add(id);
+  try { sessionStorage.setItem('fdm:myopts:' + S.route.code, JSON.stringify([...S.myOptionIds])); } catch { /* ignore */ }
 }
 
 function setFamily(code) {
@@ -540,18 +554,21 @@ function requireHost(g) {
   if (g.host !== S.clientId) throw new UserError('Only the host can do that.');
 }
 
+// Players can join at any point. Mid-Elimination they go to the end of the
+// turn order; mid-vote they vote in the current round.
 function addPlayer(name) {
   return updateGame((g) => {
-    if (g.phase !== 'lobby') throw new UserError('The game has already moved on.');
     const err = nameError(name, g.players.map((p) => p.name));
     if (err) throw new UserError(err);
-    g.players.push({ id: uid(), name, device: S.clientId });
+    const id = uid();
+    g.players.push({ id, name, device: S.clientId });
+    if (g.phase === 'play' && g.method === 'elimination') g.order.push(id);
   });
 }
 
 function removePlayer(id) {
   return updateGame((g) => {
-    if (g.phase !== 'lobby') throw new UserError('Players can only be removed before options are added.');
+    if (g.phase !== 'lobby' && g.phase !== 'options') throw new UserError('Players can only be removed before the decision starts.');
     g.players = g.players.filter((p) => p.id !== id);
   });
 }
@@ -814,7 +831,24 @@ async function onEliminate(option, turn) {
     ok: 'Eliminate',
     danger: true,
   });
-  if (ok) run(() => eliminateAction(option.id, turn));
+  if (!ok) return;
+  // Hide it on this phone straight away, and keep this phone's list frozen
+  // as it stands after this elimination until its next turn.
+  const snapKey = S.elimSnap && S.elimSnap.key;
+  S.elimPending = { key: snapKey, id: option.id };
+  const done = await run(() => eliminateAction(option.id, turn));
+  if (done && S.elimSnap && S.elimSnap.key === snapKey) S.elimSnap.ids = S.elimSnap.ids.filter((id) => id !== option.id);
+  S.elimPending = null;
+  render();
+}
+
+async function onPlayFor(turnKey, player) {
+  const ok = await confirmDialog({
+    title: `Play this turn for ${player.name}?`,
+    message: `This shows you the current list. Only do it if ${player.name} is stuck.`,
+    ok: 'Play for them',
+  });
+  if (ok) { S.playFor = turnKey; render(); }
 }
 
 function familyDialog() {
@@ -1088,16 +1122,22 @@ function gameView() {
         h('span', {}, '⚠️'),
         h('span', { class: 'grow small' }, "This isn't your family's current game."),
         h('button', { class: 'btn primary', onClick: () => location.replace('#/game/' + current) }, 'Switch')),
+      g.phase !== 'lobby' && !hasPlayerHere && addPlayerCard(g),
       body,
+      g.phase !== 'lobby' && hasPlayerHere && (S.showAddPlayer === code
+        ? addPlayerCard(g)
+        : h('div', { class: 'center' }, h('button', {
+          class: 'btn text small', id: 'show-add-player', onClick: () => { S.showAddPlayer = code; render(); },
+        }, '+ Add another player on this phone'))),
       !isHost && hasPlayerHere && h('div', { class: 'center takeover' },
         h('button', { class: 'btn text small', id: 'take-over', onClick: onTakeOver }, "Host's phone stuck? Take over as host"))));
 }
 
-function lobbyPhase(g, isHost) {
+function addPlayerCard(g) {
   const taken = new Set(g.players.map((p) => p.name.toLowerCase()));
   const suggestions = (g.familyNames || []).filter((n) => !taken.has(n.toLowerCase()));
   const mine = g.players.filter((p) => p.device === S.clientId);
-  const code = S.route.code;
+  const late = g.phase !== 'lobby';
 
   const submitName = (e) => {
     e.preventDefault();
@@ -1106,6 +1146,25 @@ function lobbyPhase(g, isHost) {
     if (!n) return;
     run(() => addPlayer(n)).then((ok) => { if (ok) input.value = ''; });
   };
+
+  let lateNote = null;
+  if (g.phase === 'play' && g.method === 'elimination') lateNote = 'New players join at the end of the turn order.';
+  else if (g.phase === 'play' && BALLOT_METHODS.has(g.method)) lateNote = 'New players vote in the current round.';
+  else if (g.phase === 'tiebreak' || g.phase === 'winner') lateNote = 'New players join in from the next round.';
+
+  return h('section', { class: 'card', id: 'add-player-card' },
+    h('h2', {}, mine.length ? 'Add more players on this phone' : late ? 'Join in: who is playing on this phone?' : 'Who is playing on this phone?'),
+    h('p', { class: 'muted small' }, 'Tap your name. If several people share this phone, add each of them. Each person can only play from one phone.'),
+    lateNote && h('p', { class: 'muted small' }, lateNote),
+    suggestions.length > 0 && h('div', { class: 'chips' },
+      suggestions.map((n) => h('button', { class: 'chip', 'data-key': 's-' + n, onClick: () => run(() => addPlayer(n)) }, '+ ' + n))),
+    h('form', { class: 'row', onSubmit: submitName },
+      h('input', { id: 'player-name', class: 'input', placeholder: 'Another name', maxlength: 30, autocomplete: 'off', 'aria-label': 'Player name' }),
+      h('button', { class: 'btn', type: 'submit' }, 'Add')));
+}
+
+function lobbyPhase(g, isHost) {
+  const code = S.route.code;
 
   return [
     h('section', { class: 'card center', id: 'code-card' },
@@ -1126,14 +1185,7 @@ function lobbyPhase(g, isHost) {
             class: 'icon-btn sm', 'aria-label': `Remove ${p.name}`, onClick: () => run(() => removePlayer(p.id)),
           }, '×'))))),
 
-    h('section', { class: 'card', id: 'add-player-card' },
-      h('h2', {}, mine.length ? 'Add more players on this phone' : 'Who is playing on this phone?'),
-      h('p', { class: 'muted small' }, 'Tap your name. If several people share this phone, add each of them. Each person can only play from one phone.'),
-      suggestions.length > 0 && h('div', { class: 'chips' },
-        suggestions.map((n) => h('button', { class: 'chip', 'data-key': 's-' + n, onClick: () => run(() => addPlayer(n)) }, '+ ' + n))),
-      h('form', { class: 'row', onSubmit: submitName },
-        h('input', { id: 'player-name', class: 'input', placeholder: 'Another name', maxlength: 30, autocomplete: 'off', 'aria-label': 'Player name' }),
-        h('button', { class: 'btn', type: 'submit' }, 'Add'))),
+    addPlayerCard(g),
 
     isHost
       ? h('button', { class: 'btn primary block big', id: 'to-options', disabled: g.players.length < 2, onClick: () => run(toOptions) },
@@ -1150,17 +1202,20 @@ function optionsPhase(g, isHost) {
     if (!text) return;
     const id = uid();
     input.value = ''; // clear right away so the next option can be typed
-    run(async () => {
-      await addOption(id, text);
-      S.myOptionIds.add(id);
-    }).then((ok) => { if (!ok && !input.value) input.value = text; });
+    rememberMyOption(id); // before saving, so this phone shows it as soon as it arrives
+    run(() => addOption(id, text)).then((ok) => { if (!ok && !input.value) input.value = text; });
   };
   const need = minOptions(g);
   const M = METHODS[g.method];
+  const show = settingsOf(g).showOptions;
+  const visible = show ? g.options : g.options.filter((o) => S.myOptionIds.has(o.id));
+  const hidden = g.options.length - visible.length;
 
   return [
     h('section', { class: 'card', id: 'option-entry' },
-      h('p', { class: 'muted small' }, 'Everyone can add options from their own phone, as many as they like. Nobody can see who suggested what.'),
+      h('p', { class: 'muted small' }, show
+        ? "Everyone can add options from their own phone, as many as they like. Nobody can see who suggested what."
+        : "Everyone can add options from their own phone, as many as they like. You only see your own until the decision starts, so nobody can tell who suggested what."),
       h('form', { class: 'row', onSubmit: submitOption },
         h('input', { id: 'option-input', class: 'input', placeholder: 'Add an option', maxlength: 60, autocomplete: 'off', 'aria-label': 'Option' }),
         h('button', { class: 'btn', type: 'submit' }, 'Add')),
@@ -1168,13 +1223,16 @@ function optionsPhase(g, isHost) {
 
     h('section', { class: 'card', id: 'options-card' },
       h('h2', {}, `Options (${g.options.length})`),
-      g.options.length === 0
-        ? h('p', { class: 'muted small' }, 'No options yet.')
-        : h('ul', { class: 'list' }, g.options.map((o) => h('li', { 'data-key': 'o-' + o.id },
-          h('span', { class: 'grow' }, o.text),
-          S.myOptionIds.has(o.id) && h('button', {
-            class: 'icon-btn sm', 'aria-label': `Remove ${o.text}`, title: 'Remove (you added this)', onClick: () => run(() => removeOption(o.id)),
-          }, '×'))))),
+      g.options.length === 0 && h('p', { class: 'muted small' }, 'No options yet.'),
+      visible.length > 0 && h('ul', { class: 'list' }, visible.map((o) => h('li', { 'data-key': 'o-' + o.id },
+        h('span', { class: 'grow' }, o.text),
+        !show && h('span', { class: 'tag muted-tag' }, 'yours'),
+        (S.myOptionIds.has(o.id) || (isHost && show)) && h('button', {
+          class: 'icon-btn sm', 'aria-label': `Remove ${o.text}`, title: 'Remove', onClick: () => run(() => removeOption(o.id)),
+        }, '×')))),
+      hidden > 0 && h('p', { class: 'muted small', id: 'hidden-note' },
+        `🙈 ${hidden} ${hidden === 1 ? 'option' : 'options'} from others ${hidden === 1 ? 'is' : 'are'} hidden until the decision starts.`),
+      isHost && setting("Everyone's options while adding", segmented('showOptions', show, [[false, 'Hidden'], [true, 'Shown (you can remove any)']], false))),
 
     h('p', { class: 'muted small' }, 'Playing: ' + g.players.map((p) => p.name).join(', ')),
 
@@ -1255,7 +1313,7 @@ function methodSettings(g, isHost) {
   if (g.method === 'ranked') return h('p', { class: 'muted small' }, 'Ties for last place are broken by fewest 2nd-choice votes, then at random.');
   if (['vote', 'points', 'stars'].includes(g.method) || g.method === 'bracket') {
     return h('p', { class: 'muted small' }, g.method === 'bracket'
-      ? 'A tied match is settled by a coin flip.'
+      ? 'Everyone picks a favorite in every matchup of a round before passing the phone. A tied matchup is settled by a coin flip.'
       : 'Ties are broken by the 👑 on your priority list if they’re playing, otherwise at random.');
   }
   return null;
@@ -1277,17 +1335,32 @@ function playPhase(g, isHost) {
   return ballotPhase(g, isHost);
 }
 
+// Secrecy: each phone sees the list as it stood after its own last turn and
+// only catches up when its turn comes round again, so it can't tell who
+// knocked out what. (Phones without players stay on the starting list.)
 function eliminatePhase(g, isHost) {
   const cur = currentPlayer(g);
   const mine = cur.device === S.clientId;
-  const canAct = mine || isHost;
+  const turnKey = `${S.route.code}:${g.playId}:${g.turn}:${g.options.length}`;
+  const playingFor = isHost && !mine && S.playFor === turnKey;
+  const live = mine || playingFor;
+
+  const snapKey = `${S.route.code}:${g.playId}`;
+  if (!S.elimSnap || S.elimSnap.key !== snapKey) S.elimSnap = { key: snapKey, ids: (g.allOptions || g.options).map((o) => o.id) };
+  if (live) S.elimSnap.ids = g.options.map((o) => o.id);
+  const pending = S.elimPending && S.elimPending.key === snapKey ? S.elimPending.id : null;
+  const shown = S.elimSnap.ids.filter((id) => id !== pending);
+  const liveIds = new Set(g.options.map((o) => o.id));
+  const behind = shown.filter((id) => !liveIds.has(id)).length;
 
   return [
-    h('div', { class: 'turn-banner' + (mine ? ' mine' : ''), id: 'turn-banner' },
+    h('div', { class: 'turn-banner' + (live ? ' mine' : ''), id: 'turn-banner' },
       mine
         ? [h('strong', {}, `${cur.name}, it's your turn!`), h('div', { class: 'small' }, 'Tap an option to eliminate it.')]
-        : [h('strong', {}, `Waiting for ${cur.name}…`),
-          isHost && h('div', { class: 'small' }, "As the host you can tap for them if they're stuck.")]),
+        : playingFor
+          ? [h('strong', {}, `Playing for ${cur.name}`), h('div', { class: 'small' }, 'Tap an option to eliminate it for them.')]
+          : [h('strong', {}, `Waiting for ${cur.name}…`),
+            isHost && h('button', { class: 'btn text small', id: 'play-for', onClick: () => onPlayFor(turnKey, cur) }, `${cur.name} stuck? Play this turn for them`)]),
 
     h('section', { class: 'card', id: 'order-card' },
       h('div', { class: 'muted small' }, 'Turn order'),
@@ -1297,10 +1370,14 @@ function eliminatePhase(g, isHost) {
       }))),
 
     h('p', { class: 'muted small', id: 'left-count' }, `${g.options.length} options left`),
+    !live && h('p', { class: 'muted small', id: 'stale-note' }, behind > 0
+      ? `👀 This is the list from your last turn. ${behind} more ${behind === 1 ? 'has' : 'have'} been knocked out since; you'll see which on your turn, so nobody can tell who knocked out what.`
+      : "👀 You'll see the latest list on your turn, so nobody can tell who knocked out what."),
 
-    h('div', { id: 'options' }, g.options.map((o) => h('button', {
-      class: 'option-btn', 'data-key': 'o-' + o.id, disabled: !canAct, onClick: () => onEliminate(o, g.turn),
-    }, h('span', { class: 'grow' }, o.text), h('span', { class: 'x', 'aria-hidden': 'true' }, '✕')))),
+    h('div', { id: 'options' }, shown.map((id) => h('button', {
+      class: 'option-btn', 'data-key': 'o-' + id, disabled: !live,
+      onClick: () => onEliminate({ id, text: optName(g, id) }, g.turn),
+    }, h('span', { class: 'grow' }, optName(g, id)), h('span', { class: 'x', 'aria-hidden': 'true' }, '✕')))),
   ];
 }
 
@@ -1328,7 +1405,7 @@ function ballotPhase(g, isHost) {
 
   return [
     vetoedNote(g),
-    g.method === 'bracket' && matchCard(g),
+    g.method === 'bracket' && bracketTree(g),
     h('section', { class: 'card', id: 'vote-status' },
       h('div', { class: 'row' },
         h('strong', { class: 'grow' }, `${done} of ${total} voted`),
@@ -1342,7 +1419,6 @@ function ballotPhase(g, isHost) {
       : h('p', { class: 'center muted', id: 'waiting' }, g.players.some((p) => p.device === S.clientId)
         ? 'Thanks! Waiting for everyone else to vote…'
         : 'Waiting for everyone to vote…'),
-    g.method === 'bracket' && bracketHistory(g),
   ];
 }
 
@@ -1357,7 +1433,7 @@ function emptyDraft(g) {
   if (g.method === 'vote') return s.voteStyle === 'approval' ? [] : null;
   if (g.method === 'points' || g.method === 'stars') return {};
   if (g.method === 'ranked' || g.method === 'veto') return [];
-  return null; // bracket
+  return {}; // bracket: matchup index -> pick
 }
 
 function ballotHint(g) {
@@ -1368,7 +1444,7 @@ function ballotHint(g) {
     case 'ranked': return 'Tap options in order of preference, favorite first. Rank as many as you like. Tap again to un-rank.';
     case 'veto': return `Pick ${g.vetoesEach === 1 ? 'the one option' : `${g.vetoesEach} options`} you’d most like to rule out.`;
     case 'stars': return 'Rate each option. Tap the same star again to clear it.';
-    case 'bracket': return 'Which one do you prefer?';
+    case 'bracket': return 'Pick your favorite in every matchup this round, then pass the phone if someone else votes on it.';
     default: return '';
   }
 }
@@ -1379,7 +1455,10 @@ function ballotProblem(g, data) {
     case 'vote':
       if (s.voteStyle === 'approval') return data.length ? null : 'Tick at least one';
       return data ? null : 'Pick one';
-    case 'bracket': return data ? null : 'Pick one';
+    case 'bracket': {
+      const more = openMatches(g).filter((m) => !data[m.j]).length;
+      return more === 0 ? null : `Pick ${more} more ${more === 1 ? 'matchup' : 'matchups'}`;
+    }
     case 'points': {
       const left = g.pointsEach - Object.values(data).reduce((t, n) => t + n, 0);
       return left === 0 ? null : `${left} ${left === 1 ? 'point' : 'points'} left to spend`;
@@ -1414,17 +1493,26 @@ function ballotCard(g, player, voters, round) {
 function ballotEditor(g, d) {
   const s = settingsOf(g);
   const set = (v) => { d.data = v; render(); };
-  const opts = g.method === 'bracket'
-    ? g.bracket.queue.slice(0, 2).map((id) => ({ id, text: optName(g, id) }))
-    : g.options;
+  const opts = g.options;
 
-  if (g.method === 'bracket' || (g.method === 'vote' && s.voteStyle !== 'approval')) {
-    const buttons = opts.map((o) => h('button', {
+  if (g.method === 'bracket') {
+    const open = openMatches(g);
+    return h('div', { id: 'editor' }, open.map((m, k) => h('div', { class: 'match-pick', 'data-key': 'mp' + m.j },
+      h('div', { class: 'small muted' }, `Matchup ${k + 1} of ${open.length}`),
+      h('div', { class: 'choices' }, [m.x, m.y].map((id, i) => [
+        i === 1 && h('div', { class: 'vs center' }, 'vs'),
+        h('button', {
+          class: 'choice' + (d.data[m.j] === id ? ' on' : ''), 'data-key': 'c-' + id, 'aria-pressed': String(d.data[m.j] === id),
+          onClick: () => set({ ...d.data, [m.j]: id }),
+        }, h('span', { class: 'grow' }, optName(g, id)), h('span', { class: 'mark' }, d.data[m.j] === id ? '●' : '○')),
+      ])))));
+  }
+
+  if (g.method === 'vote' && s.voteStyle !== 'approval') {
+    return h('div', { class: 'choices', id: 'editor' }, opts.map((o) => h('button', {
       class: 'choice' + (d.data === o.id ? ' on' : ''), 'data-key': 'c-' + o.id, 'aria-pressed': String(d.data === o.id),
       onClick: () => set(o.id),
-    }, h('span', { class: 'grow' }, o.text), h('span', { class: 'mark' }, d.data === o.id ? '●' : '○')));
-    if (g.method === 'bracket') buttons.splice(1, 0, h('div', { class: 'vs center' }, 'vs'));
-    return h('div', { class: 'choices', id: 'editor' }, buttons);
+    }, h('span', { class: 'grow' }, o.text), h('span', { class: 'mark' }, d.data === o.id ? '●' : '○'))));
   }
 
   if (g.method === 'vote' || g.method === 'veto') {
@@ -1487,29 +1575,32 @@ function ballotEditor(g, d) {
   return null;
 }
 
-function matchCard(g) {
+// The whole bracket, round by round, so everyone can follow along.
+function bracketTree(g) {
   const b = g.bracket;
-  const [x, y] = b.queue;
-  const matchNo = b.history.filter((m) => m.round === b.round && !m.bye).length + 1;
-  return h('section', { class: 'card center', id: 'match-card' },
-    h('div', { class: 'muted small' }, `Round ${b.round} · Match ${matchNo}`),
-    h('div', { class: 'match' }, h('strong', {}, optName(g, x)), h('span', { class: 'vs' }, 'vs'), h('strong', {}, optName(g, y))));
-}
-
-function matchLine(g, m) {
-  if (m.bye) return `${optName(g, m.x)} gets a bye`;
-  const loser = m.winner === m.x ? m.y : m.x;
-  const [vw, vl] = m.winner === m.x ? [m.vx, m.vy] : [m.vy, m.vx];
-  return `${optName(g, m.winner)} beat ${optName(g, loser)} ${vw}–${vl}${m.coin ? ' (coin flip)' : ''}`;
-}
-
-function bracketHistory(g) {
-  const hist = (g.bracket && g.bracket.history) || (g.result && g.result.history) || [];
-  if (!hist.length) return null;
-  return h('section', { class: 'card', id: 'bracket-history' },
-    h('h2', {}, 'Bracket results'),
-    h('ul', { class: 'list' }, hist.map((m, i) => h('li', { 'data-key': 'bh-' + i },
-      h('span', { class: 'tag muted-tag' }, `R${m.round}`), h('span', { class: 'grow' }, matchLine(g, m))))));
+  if (!b || !b.rounds) return null;
+  const n = b.rounds.length;
+  const roundName = (r) => (r === n - 1 ? 'Final' : r === n - 2 ? 'Semifinals' : r === n - 3 ? 'Quarterfinals' : `Round ${r + 1}`);
+  const champion = g.phase === 'winner' && b.rounds[n - 1].matches[0].winner;
+  const slot = (m, id, v) => {
+    const decided = !!m.winner && !m.bye;
+    return h('div', { class: 'slot' + (decided && id === m.winner ? ' win' : '') + (decided && id && id !== m.winner ? ' lose' : '') + (!id ? ' empty' : '') },
+      h('span', { class: 'grow' }, id ? optName(g, id) : m.bye ? 'bye' : 'TBD'),
+      decided && h('span', { class: 'v' }, v));
+  };
+  return h('section', { class: 'card', id: 'bracket-tree' },
+    h('h2', {}, '🏆 Bracket'),
+    h('div', { class: 'bracket-scroll' }, h('div', { class: 'bracket' },
+      b.rounds.map((rd, r) => h('div', { class: 'bracket-col' + (g.phase === 'play' && r === b.round ? ' current' : ''), 'data-key': 'br' + r },
+        h('div', { class: 'bracket-col-title' }, roundName(r)),
+        h('div', { class: 'bracket-matches' },
+          rd.matches.map((m, j) => h('div', { class: 'mbox' + (m.bye ? ' bye' : ''), 'data-key': `mb${r}-${j}` },
+            slot(m, m.x, m.vx), slot(m, m.y, m.vy),
+            m.coin && h('div', { class: 'coin' }, '🪙 coin flip'))),
+          r === n - 1 && champion && h('div', { class: 'mbox champ', 'data-key': 'champ' },
+            h('div', { class: 'slot win' }, '🏆 ' + optName(g, champion)))))))),
+    n > 3 && h('p', { class: 'muted small' }, 'Swipe sideways to see the whole bracket.'),
+    g.phase === 'play' && h('p', { class: 'muted small' }, `Voting on: ${roundName(b.round)}`));
 }
 
 /* ---------- ties ---------- */
@@ -1556,18 +1647,23 @@ function scoresCard(g) {
 
 function roundCard(g, round, i) {
   const idsSorted = Object.keys(round.counts).sort((a, b) => round.counts[b] - round.counts[a]);
-  const tieText = round.tie === 'second' ? ' (tied for last; fewest 2nd-choice votes)'
-    : round.tie === 'random' ? ' (tied for last; picked at random)' : '';
+  const out = [].concat(round.eliminated);
+  const outNames = listJoin(out.map((id) => optName(g, id)));
+  const outText = out.length > 1 && out.every((id) => round.counts[id] === 0)
+    ? `❌ ${outNames} got no first-choice votes, so they're all knocked out at once.`
+    : out.length > 1
+    ? `❌ ${outNames} are knocked out together. They tied for last, and even combined they had fewer votes than the next option, so the tie couldn't change the result.`
+    : `❌ ${outNames} is knocked out${round.tie === 'second' ? ' (tied for last; fewest 2nd-choice votes)' : round.tie === 'random' ? ' (tied for last; picked at random)' : ''}.`;
   return h('section', { class: 'card', 'data-key': 'round-' + i },
     h('h2', {}, `Round ${i + 1}`),
-    h('ul', { class: 'list' }, idsSorted.map((id) => h('li', { class: id === round.eliminated ? 'out' : '', 'data-key': 'rc-' + id },
+    h('ul', { class: 'list' }, idsSorted.map((id) => h('li', { class: out.includes(id) ? 'out' : '', 'data-key': 'rc-' + id },
       h('span', { class: 'grow' }, optName(g, id)), h('strong', {}, round.counts[id])))),
-    h('p', { class: 'small' }, `❌ ${optName(g, round.eliminated)} is knocked out${tieText}.`),
+    h('p', { class: 'small' }, outText),
     round.exhausted > 0 && h('p', { class: 'muted small' }, `${round.exhausted} ${round.exhausted === 1 ? 'ballot has' : 'ballots have'} no choices left.`));
 }
 
 function revealKey(g) {
-  return `${S.route.code}:${g.result.rounds.map((r) => r.eliminated).join(',')}`;
+  return `${S.route.code}:${g.playId}:${g.result.rounds.map((r) => [].concat(r.eliminated).join('+')).join(',')}`;
 }
 
 function rankedRevealDone(g) {
@@ -1649,7 +1745,7 @@ function winnerPhase(g, isHost) {
     vetoedNote(g),
     scoresCard(g),
     r.kind === 'ranked' && r.rounds.map((round, i) => roundCard(g, round, i)),
-    r.kind === 'bracket' && bracketHistory(g),
+    r.kind === 'bracket' && bracketTree(g),
     isHost
       ? h('div', { class: 'stack', id: 'winner-controls' },
         h('button', { class: 'btn primary big', id: 'decide-again', onClick: () => run(decideAgain) }, 'Decide again with the same options'),

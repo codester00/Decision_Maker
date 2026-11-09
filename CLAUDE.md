@@ -16,13 +16,16 @@ The owner is not a developer. Explain things in plain language and give copy-pas
 
 ## Data model
 - `families/{code}`: `{ members: [{id, name, decisions, positions: {"1": n}}], activeGame, createdAt }`. The `members` array order is the priority order.
-- `games/{code}`: `{ host, family, crown, familyNames, phase: lobby|options|play|tiebreak|winner, method, settings, players: [{id, name, device}], options: [{id, text}], createdAt }` plus per-round fields that `clearPlay` removes: `playId` (unique per round; part of `ballotRound`), `allOptions`/`setup` (to restore for "decide again"), `names` (id → text), `voted`, `tally`, `ballotCount`, `ballots` (ranked: `[{r: [ids]}]`, since Firestore can't nest arrays), `order`/`turn` (elimination), `bracket`, `spin`, `tie`, `vetoed`, `pointsEach`, `vetoesEach`, `winner`, `result`.
+- `games/{code}`: `{ host, family, crown, familyNames, phase: lobby|options|play|tiebreak|winner, method, settings, players: [{id, name, device}], options: [{id, text}], createdAt }` plus per-round fields that `clearPlay` removes: `playId` (unique per round; part of `ballotRound`), `allOptions`/`setup` (to restore for "decide again"), `names` (id → text), `voted`, `tally`, `ballotCount`, `ballots` (ranked: `[{r: [ids]}]`, since Firestore can't nest arrays), `order`/`turn` (elimination), `bracket` (`{ round, rounds: [{ matches: [{x, y, winner, vx, vy, coin, bye}] }] }`, built in full at the start; old queue-style brackets are reset by `normalizeGame`), `spin`, `tie`, `vetoed`, `pointsEach`, `vetoesEach`, `winner`, `result`.
 - Old game docs (`phase: 'eliminate'`, no `method`) are upgraded on read by `normalizeGame`.
 - `device` is a per-phone client id (localStorage; per tab in demo mode).
 - Real family data lives in Firestore, so **keep the code compatible with existing documents** (treat new fields as optional, default them on read).
 
 ## Rules the owner agreed to (don't break them)
 - Group decisions never touch the priority list or stats, store no record of who suggested, eliminated or voted for what (totals only; ranked ballots unnamed and randomly placed), and are deleted when the host ends them.
+- Secrecy rules: options are hidden from other phones while being added unless the host sets `settings.showOptions`, and shuffled at `startPlay`. A phone's own option ids live only in its sessionStorage (`fdm:myopts:CODE`). In Elimination each phone shows the list as of its own last turn (`S.elimSnap`; phones without players stay on the starting list), and the host must explicitly choose "play for" to see the live list on someone else's turn. Bracket ballots cover a whole round at once.
+- Players can join at any phase (`addPlayer`): mid-Elimination they're appended to `order`; mid-vote they vote in the current round. Removing players is only allowed in lobby/options.
+- Ranked choice eliminates in batches when tied-for-last options' combined votes are below the next option (covers zero-vote options); otherwise fewest 2nd choices, then random. `round.eliminated` is an array.
 - Tie-breaks: 👑 (`g.crown`, the family's #1 when the game started or was reset) if playing, else random. Ranked choice: fewest 2nd choices, then random. Bracket: coin flip.
 - Only one game per family: claim `activeGame` atomically (compare-and-set in `createGame`); replacing a game deletes the old one.
 - A player name appears once per game and belongs to exactly one phone.

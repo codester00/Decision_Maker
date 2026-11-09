@@ -28,7 +28,7 @@ export const METHODS = {
   },
   ranked: {
     label: 'Ranked choice', icon: '🥇',
-    desc: 'Rank your favorites. The option with the fewest first choices is knocked out each round, and those votes move to their next choice.',
+    desc: 'Rank your favorites. Each round the option with the fewest first choices is knocked out, and those votes move to their next choice.',
   },
   veto: {
     label: 'Veto round', icon: '🚫',
@@ -36,7 +36,7 @@ export const METHODS = {
   },
   bracket: {
     label: 'Bracket', icon: '🏆',
-    desc: 'Options face off two at a time, tournament style. Everyone votes on each match.',
+    desc: 'Options face off two at a time, tournament style. Each round, everyone picks a favorite in every matchup.',
   },
   stars: {
     label: 'Star rating', icon: '⭐',
@@ -54,6 +54,7 @@ export const DEFAULT_SETTINGS = {
   points: null, // null = one point per option
   maxPer: 0, // 0 = no limit
   randomTarget: 'option', // option | person
+  showOptions: false, // show everyone's options while they're being added
   vetoes: 1,
   vetoThen: 'random', // random | vote
 };
@@ -98,6 +99,8 @@ export function normalizeGame(g) {
   if (!g.settings) g.settings = {};
   if (!g.players) g.players = [];
   if (!g.options) g.options = [];
+  // Brackets from before the full-bracket version can't be continued.
+  if (g.bracket && !g.bracket.rounds) resetToOptions(g);
   return g;
 }
 
@@ -126,7 +129,7 @@ export function resetToLobby(g) {
 }
 
 // Identifies the current round of ballots, so a ballot can't land in the next one.
-export const ballotRound = (g) => `${g.playId || 0}:${g.method}:${g.bracket ? g.bracket.history.length : 0}`;
+export const ballotRound = (g) => `${g.playId || 0}:${g.method}:${g.bracket ? g.bracket.round : 0}`;
 
 /* ---------- starting ---------- */
 
@@ -140,6 +143,8 @@ export function startPlay(g, rand) {
   }
   clearPlay(g);
   g.setup = { method: g.method, settings: { ...g.settings } };
+  // Shuffle so the order options were added in can't hint at who added them.
+  g.options = shuffleWith(g.options, rand);
   g.allOptions = g.options.map((o) => ({ ...o }));
   g.names = Object.fromEntries(g.options.map((o) => [o.id, o.text]));
   g.playId = Math.floor(rand() * 1e9) + 1; // unique per round of deciding
@@ -158,8 +163,8 @@ function initMethod(g, rand) {
   } else if (g.method === 'ranked') {
     g.ballots = [];
   } else if (g.method === 'bracket') {
-    g.bracket = { queue: shuffleWith(ids, rand), winners: [], round: 1, history: [] };
-    advanceBracket(g, rand);
+    g.bracket = buildBracket(ids, rand);
+    openBracketRound(g);
   } else {
     g.tally = Object.fromEntries(ids.map((id) => [id, 0]));
     g.ballotCount = 0;
@@ -235,8 +240,12 @@ export function applyBallot(g, ballot, rand) {
     // Firestore can't store arrays inside arrays, so wrap each ballot.
     g.ballots.splice(Math.floor(rand() * (g.ballots.length + 1)), 0, { r: order });
   } else if (m === 'bracket') {
-    if (!g.bracket.queue.slice(0, 2).includes(ballot)) throw new RuleError('Pick one of the two.');
-    g.tally[ballot]++;
+    const open = openMatches(g);
+    const picks = ballot || {};
+    for (const { j, x, y } of open) {
+      if (picks[j] !== x && picks[j] !== y) throw new RuleError('Pick a favorite in every matchup.');
+    }
+    for (const { j } of open) g.tally[picks[j]]++;
   } else {
     throw new RuleError('This method has no ballots.');
   }
@@ -246,7 +255,7 @@ export function applyBallot(g, ballot, rand) {
 // Called when everyone has voted (or the host closes voting).
 export function resolveBallots(g, crownName, rand) {
   const m = g.method;
-  if (m === 'bracket') return resolveMatch(g, crownName, rand);
+  if (m === 'bracket') return resolveBracketRound(g, rand);
   if (m === 'ranked') {
     const { winner, rounds } = instantRunoff(ids(g), g.ballots.map((b) => b.r), rand);
     g.result = { kind: 'ranked', rounds };
@@ -322,53 +331,91 @@ function resolveVeto(g, rand) {
   g.vetoed = vetoed;
 }
 
-/* ---------- bracket ---------- */
+/* ---------- bracket ----------
+   The whole bracket is built at the start so everyone can see it.
+   g.bracket = { round, rounds: [{ matches: [{ x, y, winner, vx, vy, coin, bye }] }] }
+   (Firestore can't nest arrays directly, hence the { matches } wrapper.)
+   If the number of options isn't a power of two, some first-round
+   matches are byes: that option goes straight through. */
 
-function advanceBracket(g, rand) {
-  const b = g.bracket;
-  for (;;) {
-    if (b.queue.length === 1) {
-      const lone = b.queue.shift();
-      b.history.push({ round: b.round, x: lone, bye: true });
-      b.winners.push(lone);
+function buildBracket(optionIds, rand) {
+  const order = shuffleWith(optionIds, rand);
+  let size = 1;
+  while (size < order.length) size *= 2;
+  const firstCount = size / 2;
+  const byes = new Set(shuffleWith([...Array(firstCount).keys()], rand).slice(0, size - order.length));
+  let k = 0;
+  const first = [];
+  for (let i = 0; i < firstCount; i++) {
+    if (byes.has(i)) {
+      const x = order[k++];
+      first.push({ x, y: null, bye: true, winner: x });
+    } else {
+      first.push({ x: order[k++], y: order[k++], winner: null });
     }
-    if (b.queue.length === 0) {
-      if (b.winners.length === 1) {
-        g.result = { kind: 'bracket', history: b.history };
-        return win(g, b.winners[0], null, rand);
-      }
-      b.queue = b.winners;
-      b.winners = [];
-      b.round++;
-      continue;
-    }
-    break;
   }
-  g.tally = { [b.queue[0]]: 0, [b.queue[1]]: 0 };
+  const rounds = [{ matches: first }];
+  for (let m = firstCount / 2; m >= 1; m /= 2) {
+    rounds.push({ matches: Array.from({ length: m }, () => ({ x: null, y: null, winner: null })) });
+  }
+  const b = { round: 0, rounds };
+  sendWinnersForward(b);
+  return b;
+}
+
+function sendWinnersForward(b) {
+  for (let r = 0; r < b.rounds.length - 1; r++) {
+    b.rounds[r].matches.forEach((m, j) => {
+      if (m.winner) b.rounds[r + 1].matches[j >> 1][j % 2 === 0 ? 'x' : 'y'] = m.winner;
+    });
+  }
+}
+
+// The matchups everyone votes on in the current round.
+export function openMatches(g) {
+  const b = g.bracket;
+  return b.rounds[b.round].matches
+    .map((m, j) => ({ j, x: m.x, y: m.y, winner: m.winner }))
+    .filter((m) => !m.winner && m.x && m.y);
+}
+
+function openBracketRound(g) {
+  g.tally = {};
+  for (const { x, y } of openMatches(g)) { g.tally[x] = 0; g.tally[y] = 0; }
   g.voted = [];
   g.ballotCount = 0;
 }
 
-function resolveMatch(g, crownName, rand) {
+function resolveBracketRound(g, rand) {
   const b = g.bracket;
-  const [x, y] = b.queue;
-  const vx = g.tally[x] || 0;
-  const vy = g.tally[y] || 0;
-  let w = vx > vy ? x : y;
-  const coin = vx === vy;
-  if (coin) w = rand() < 0.5 ? x : y;
-  b.history.push({ round: b.round, x, y, vx, vy, winner: w, coin });
-  b.winners.push(w);
-  b.queue.splice(0, 2);
-  advanceBracket(g, rand);
+  const matches = b.rounds[b.round].matches;
+  for (const { j, x, y } of openMatches(g)) {
+    const vx = g.tally[x] || 0;
+    const vy = g.tally[y] || 0;
+    const coin = vx === vy;
+    const winner = coin ? (rand() < 0.5 ? x : y) : (vx > vy ? x : y);
+    Object.assign(matches[j], { vx, vy, coin, winner });
+  }
+  sendWinnersForward(b);
+  if (b.round === b.rounds.length - 1) {
+    g.result = { kind: 'bracket' };
+    return win(g, b.rounds[b.round].matches[0].winner, null, rand);
+  }
+  b.round++;
+  openBracketRound(g);
 }
 
-/* ---------- ranked choice (instant runoff) ---------- */
-
-// Each round, count every ballot for its highest-ranked option still in the
-// race, and knock out the option with the fewest votes. Ties for last place
-// are broken by fewest 2nd-choice votes, then at random. Repeats until one
-// option remains.
+/* ---------- ranked choice (instant runoff) ----------
+   Each round, count every ballot for its highest-ranked option still in
+   the race, and knock out the option with the fewest votes.
+   Ties for last place:
+   - If the tied options' votes added together are still fewer than the
+     next option's, the tie can't change the outcome, so they all go at
+     once. (This is also how options with no first-choice votes all go in
+     the first round.)
+   - Otherwise, the one with the fewest 2nd-choice votes goes; if that's
+     tied too, one is picked at random.
+   Repeats until one option remains. */
 export function instantRunoff(optionIds, ballots, rand) {
   let remaining = [...optionIds];
   const second = Object.fromEntries(optionIds.map((id) => [id, 0]));
@@ -383,17 +430,23 @@ export function instantRunoff(optionIds, ballots, rand) {
       else exhausted++;
     }
     const min = Math.min(...remaining.map((id) => counts[id]));
-    let lowest = remaining.filter((id) => counts[id] === min);
+    const lowest = remaining.filter((id) => counts[id] === min);
+    const higher = remaining.filter((id) => counts[id] > min);
+    let out;
     let tie = null;
-    if (lowest.length > 1) {
+    if (lowest.length === 1) {
+      out = lowest;
+    } else if (higher.length && min * lowest.length < Math.min(...higher.map((id) => counts[id]))) {
+      out = lowest;
+      tie = 'batch';
+    } else {
       const minSecond = Math.min(...lowest.map((id) => second[id]));
       const fewer = lowest.filter((id) => second[id] === minSecond);
       tie = fewer.length === 1 ? 'second' : 'random';
-      lowest = fewer;
+      out = [fewer[Math.floor(rand() * fewer.length)]];
     }
-    const out = lowest[Math.floor(rand() * lowest.length)];
     rounds.push({ counts, exhausted, eliminated: out, tie });
-    remaining = remaining.filter((id) => id !== out);
+    remaining = remaining.filter((id) => !out.includes(id));
   }
   return { winner: remaining[0], rounds };
 }
