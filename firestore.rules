@@ -1,6 +1,6 @@
 rules_version = '2';
 
-// Each family and each game is one document whose ID is its code.
+// Each family, game and tracker is one document whose ID is its code.
 // Anyone signed in (the app signs in anonymously) may read or write a document
 // if they know its code. Listing all documents is NOT allowed, so codes can't
 // be discovered by browsing.
@@ -10,6 +10,9 @@ service cloud.firestore {
       allow get, create, update, delete: if request.auth != null;
     }
     match /games/{code} {
+      allow get, create, update, delete: if request.auth != null;
+    }
+    match /trackers/{id} {
       allow get, create, update, delete: if request.auth != null;
     }
   }

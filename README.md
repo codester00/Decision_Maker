@@ -42,6 +42,23 @@ Group decisions on everyone's phones. They are completely separate from the prio
 
 **Privacy:** votes are secret. The app keeps only running totals (and, for ranked choice, unnamed ballots in random order), never who suggested, eliminated or voted for what. Nothing is kept after the host ends the game. Two limits to know: with very few players, results can still be worked out (with two voters, the totals minus your own vote show the other's), and someone tech-savvy could inspect the shared database while voting is under way. Fixing the second would need a server, which this app doesn't have.
 
+### Trackers (📋 tab on the home screen)
+Long-term, fair rotations: after-dinner jobs, who presses the elevator button, who picks the music. Each tracker has people (family members or write-ins), jobs, and its own settings. Trackers move on only when someone taps **Done**, never by date or time.
+
+- **Fairness:** each round, everyone who's present earns a *fair share* of each job handed out. Stats compare real turns with fair share, so late joiners and time away are counted fairly.
+- **Order:** straight rotation, fair shuffle (random, but everyone does each job once per cycle), or random.
+- **Catch-up (add-on):** whoever is furthest behind their fair share goes first. With nothing unusual it matches the plain rotation; it evens things out after steals, swaps, time away and penalties.
+- **Away:** mark someone away (it stays until they're back). Per tracker: their turns are skipped, or they make them up later (needs Catch-up).
+- **More jobs than people:** per tracker, one job each (extras wait) or assign every job (people double up, in rotation).
+- **Someone else did it:** record who actually did it; the person whose turn it was keeps their place.
+- **Swap:** two people trade for one round.
+- **Penalties:** choose a person and a number (− / + or type it), with an optional reason. For a *privilege* tracker it's turns lost; for a *chore* tracker it's extra jobs. Penalties can also be given from the "someone else did it" screen.
+- **Undo, history and charts:** every change is logged with the time and the phone that made it. Charts show turns vs fair share, turns by job, turns over time and penalties, each with a table view.
+
+### Settings (⚙️)
+- **This phone:** the name shown in tracker history (per family).
+- **Security:** set a family PIN, then choose what it protects: **Open** (nothing), **Moderate** (deleting people, resetting stats, tracker penalties, undo, editing and deleting trackers) or **Protect all**, then adjust item by item. Once unlocked, a phone stays unlocked for 10 minutes.
+
 ## Codes and joining
 - Each family has a 6-character **family code** (👪 button). On another phone, open the app and enter the code, or send the **invite link**.
 - Each game has its own **game code**. Guests who aren't in the family can join a game with just that code.
@@ -72,6 +89,12 @@ On the live site you can also add `?demo` to the address (https://codester00.git
 5. **Project settings (⚙️) → General → Your apps → Web (`</>`)**: register an app (Firebase Hosting is not needed) and copy the `firebaseConfig` object.
 6. Paste that object into [`js/firebase-config.js`](js/firebase-config.js) in place of `null`. The values are not secret; the rules protect the data.
 
+### Firebase rules update for trackers (one time)
+Trackers are stored in their own `trackers` collection, so the rules need the version in [`firestore.rules`](firestore.rules): Firebase console → **Firestore Database → Rules**, replace everything with that file's contents, **Publish**. Until then the Trackers tab shows a reminder.
+
+### Forgot the PIN
+Firebase console → **Firestore Database → Data** → `families` → your family code → the `security` field → delete `pinHash`. That turns protection off; set a new PIN in ⚙️ Settings.
+
 ### Optional: movies now playing (TMDB)
 1. Create a free account at https://www.themoviedb.org/signup and confirm your email.
 2. Go to https://www.themoviedb.org/settings/api, click **Create** (or "click here" under *Request an API Key*), choose **Developer**, and accept the terms.
@@ -92,6 +115,9 @@ On the live site you can also add `?demo` to the address (https://codester00.git
 | `css/styles.css` | Styles (mobile-first, light and dark mode) |
 | `js/app.js` | Screens and actions |
 | `js/methods.js` | Rules for each decision method (pure logic) |
+| `js/trackers.js` | Tracker rotation, fairness, penalties, undo (pure logic) |
+| `js/security.js` | Family PIN and protection presets |
+| `js/charts.js` | Small SVG charts with table views |
 | `js/places.js` | Find nearby: OpenStreetMap place search, city lookup, TMDB movies |
 | `js/api-keys.js` | Optional keys (TMDB) |
 | `js/store.js` | Data layer: Firestore, or localStorage in demo mode |

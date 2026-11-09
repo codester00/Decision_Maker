@@ -5,6 +5,16 @@ import {
   resetToOptions, resetToLobby, ballotRound, openMatches,
 } from './methods.js';
 import {
+  KINDS as TRK_KINDS, ORDERS as TRK_ORDERS, DEFAULT_SETTINGS as TRK_DEFAULTS, TrackerError,
+  settingsOf as trkSettingsOf, activePeople, activeTasks, newTracker, plan as planRound, complete as completeRound,
+  setAbsent, swap as swapJobs, penalize, edit as editTracker, undo as undoTracker, lastUndoLabel,
+  preview as previewRounds, summary as trkSummary, timeline,
+} from './trackers.js';
+import {
+  SECTIONS, PRESETS, presetProtect, matchingPreset, isValidPin, hashPin, newSalt, checkPin, needsPin,
+} from './security.js';
+import { barChart, stackedBarChart, lineChart, seriesColor, MAX_SERIES } from './charts.js';
+import {
   CATEGORIES, RADII, unitLabel, formatDistance, searchPlaces, geocode, locateMe, moviesEnabled, nowPlaying,
 } from './places.js';
 
@@ -19,7 +29,7 @@ const $toast = document.getElementById('toast-root');
    focus and typed text while other phones' changes stream in.
    ===================================================================== */
 
-const EVENTS = ['click', 'submit', 'input', 'change', 'keydown'];
+const EVENTS = ['click', 'submit', 'input', 'change', 'keydown', 'pointermove', 'pointerdown', 'focus'];
 
 function h(tag, props, ...children) {
   const el = document.createElement(tag);
@@ -46,7 +56,10 @@ function patch(oldEl, newEl) {
     if (oldEl.data !== newEl.data) oldEl.data = newEl.data;
     return;
   }
-  for (const { name } of [...oldEl.attributes]) if (!newEl.hasAttribute(name)) oldEl.removeAttribute(name);
+  for (const { name } of [...oldEl.attributes]) {
+    if (name === 'open' && oldEl.tagName === 'DETAILS') continue; // keep "Show as table" open
+    if (!newEl.hasAttribute(name)) oldEl.removeAttribute(name);
+  }
   for (const { name, value } of [...newEl.attributes]) if (oldEl.getAttribute(name) !== value) oldEl.setAttribute(name, value);
   for (const ev of EVENTS) oldEl['on' + ev] = newEl['on' + ev];
   if ('disabled' in newEl) oldEl.disabled = newEl.disabled;
@@ -147,7 +160,9 @@ async function run(fn) {
     return true;
   } catch (e) {
     if (!(e instanceof UserError)) console.error(e);
-    toast(e instanceof UserError ? e.message : 'Something went wrong. Check your internet connection and try again.');
+    toast(e instanceof UserError ? e.message
+      : e && e.code === 'permission-denied' ? 'The server refused this. The Firebase rules may need updating (see README).'
+        : 'Something went wrong. Check your internet connection and try again.');
     return false;
   }
 }
@@ -264,6 +279,9 @@ const S = {
   playFor: null, // Elimination: host chose to play a stuck player's turn
   showAddPlayer: null, // game code where the "add another player" form is open
   finder: null, // Find nearby panel state (options phase)
+  trk: {}, // tracker id -> document (undefined while loading, null if deleted)
+  trkError: null, // e.g. 'permission-denied' when the Firebase rules need updating
+  trkDraft: null, // tracker being created or edited
   ballotFor: null, // which of this phone's players is filling in a ballot
   draft: null, // the ballot being filled in (local until submitted)
   reveal: null, // ranked-choice round reveal progress
@@ -276,6 +294,13 @@ function parseRoute() {
   if (p[0] === 'stats') return { name: 'stats' };
   if (p[0] === 'game' && p[1]) return { name: 'game', code: normCode(p[1]) };
   if (p[0] === 'join' && p[1]) return { name: 'joinFamily', code: normCode(p[1]) };
+  if (p[0] === 'trackers') return { name: 'trackers' };
+  if (p[0] === 'tracker' && p[1]) {
+    if (p[1] === 'new' || p[2] === 'edit') return { name: 'trackerEdit', id: p[1] };
+    if (p[2] === 'stats') return { name: 'trackerStats', id: p[1] };
+    return { name: 'tracker', id: p[1] };
+  }
+  if (p[0] === 'settings') return { name: 'settings' };
   return { name: 'home' };
 }
 
@@ -292,6 +317,7 @@ function goBack() {
 window.addEventListener('hashchange', () => {
   S.route = parseRoute();
   S.mode = 'normal';
+  if (S.route.name !== 'trackerEdit') S.trkDraft = null;
   $modal.replaceChildren();
   if (S.route.name === 'joinFamily' && S.route.code === S.familyCode) location.replace('#/');
   syncSubscriptions();
@@ -315,9 +341,11 @@ function syncSubscriptions() {
     famSub = { code: S.familyCode, off: null };
     S.family = undefined;
     if (S.familyCode) {
-      famSub.off = S.store.watch('families', S.familyCode, (d) => { S.family = d; render(); }, onSubError);
+      famSub.off = S.store.watch('families', S.familyCode, (d) => { S.family = d; syncTrackerSubs(); render(); }, onSubError);
     }
   }
+
+  syncTrackerSubs();
 
   const gc = S.route.name === 'game' ? S.route.code : null;
   if (gameSub.code !== gc) {
@@ -442,7 +470,7 @@ async function decide(id) {
     f.members.push(m);
     info = { id, from: i, name: m.name };
   });
-  toast(`${info.name} made the decision.`, { action: 'Undo', onAction: () => run(() => undoDecide(info)) });
+  toast(`${info.name} made the decision.`, { action: 'Undo', onAction: async () => { if (await guard('decide.undo')) run(() => undoDecide(info)); } });
 }
 
 function resetStats() {
@@ -727,6 +755,8 @@ async function onMemberTap(id) {
       validate: (n) => nameError(n, S.family.members.filter((x) => x.id !== id).map((x) => x.name)),
     });
     if (name && name !== m.name) run(() => renameMember(id, name));
+  } else if (!(await guard('decide.tap'))) {
+    // PIN protected and not unlocked
   } else if (index === 0) {
     run(() => decide(id));
   } else {
@@ -741,6 +771,7 @@ async function onMemberTap(id) {
 }
 
 async function addMemberDialog() {
+  if (!(await guard('decide.add'))) return;
   const name = await promptDialog({
     title: 'Add family member',
     ok: 'Add',
@@ -754,7 +785,12 @@ function setMode(mode) {
   render();
 }
 
-async function openGame(known = S.family.activeGame || null) {
+async function enterMode(mode) {
+  if (await guard(mode === 'delete' ? 'decide.delete' : 'decide.edit')) setMode(mode);
+}
+
+async function openGame(known = S.family.activeGame || null, guarded = false) {
+  if (!guarded && !(await guard('decide.game'))) return;
   let expected = known;
   if (expected) {
     let existing = null;
@@ -778,7 +814,7 @@ async function openGame(known = S.family.activeGame || null) {
   } catch (e) {
     if (e instanceof GameInProgress) {
       // Someone else started a game a moment ago; ask again with the fresh info.
-      openGame(e.code);
+      openGame(e.code, true);
       return;
     }
     if (!(e instanceof UserError)) console.error(e);
@@ -796,6 +832,7 @@ async function onTakeOver() {
 }
 
 async function onResetStats() {
+  if (!(await guard('decide.reset'))) return;
   const ok = await confirmDialog({
     title: 'Reset all statistics?',
     message: "Every person's decision count goes back to zero on all phones. The order of the list stays the same. This can't be undone.",
@@ -1015,9 +1052,9 @@ function bottomBar() {
   return h('footer', { class: 'bottombar', id: 'bottombar' },
     h('div', { class: 'tools' },
       tool('➕', 'Add', addMemberDialog),
-      tool('🗑️', 'Delete', () => setMode('delete'), empty),
-      tool('✏️', 'Edit', () => setMode('edit'), empty)),
-    h('button', { class: 'btn primary block big', onClick: openGame }, '🎲 Decide together'));
+      tool('🗑️', 'Delete', () => enterMode('delete'), empty),
+      tool('✏️', 'Edit', () => enterMode('edit'), empty)),
+    h('button', { class: 'btn primary block big', onClick: () => openGame() }, '🎲 Decide together'));
 }
 
 function homeView() {
@@ -1030,8 +1067,10 @@ function homeView() {
       actions: [
         h('button', { class: 'icon-btn', 'aria-label': 'Statistics', title: 'Statistics', onClick: () => navigate('#/stats') }, '📊'),
         h('button', { class: 'icon-btn', 'aria-label': 'Family and invite', title: 'Family and invite', onClick: familyDialog }, '👪'),
+        settingsBtn(),
       ],
     }),
+    mode === 'normal' && homeTabs('decide'),
     h('main', { class: 'content' },
       demoBanner(),
       f.activeGame && mode === 'normal' && h('div', { class: 'banner', id: 'game-banner' },
@@ -1070,6 +1109,11 @@ function statsView() {
       h('section', { class: 'card center' },
         h('div', { class: 'stat-total' }, total),
         h('div', { class: 'muted small' }, total === 1 ? 'decision made' : 'decisions made')),
+      members.length > 0 && barChart({
+        id: 'chart-decisions', title: 'Decisions per person',
+        rows: members.map((m) => ({ key: m.id, label: m.name, value: m.decisions || 0 })),
+        unit: 'decisions',
+      }),
       members.length === 0 && h('p', { class: 'muted center' }, 'No statistics yet.'),
       members.map((m) => {
         const entries = Object.entries(m.positions || {}).sort((a, b) => Number(a[0]) - Number(b[0]));
@@ -2004,11 +2048,838 @@ function winnerPhase(g, isHost) {
       ? h('div', { class: 'stack', id: 'winner-controls' },
         h('button', { class: 'btn primary big', id: 'decide-again', onClick: () => run(decideAgain) }, 'Decide again with the same options'),
         h('button', { class: 'btn', id: 'start-over', onClick: () => run(startOver) }, 'Start over with new options'),
-        h('button', { class: 'btn text', id: 'end-game', onClick: () => run(endGame) }, 'End game and go home'))
+        h('button', { class: 'btn text', id: 'end-game', onClick: async () => { if (await guard('decide.endGame')) run(endGame); } }, 'End game and go home'))
       : h('div', { class: 'stack' },
         h('p', { class: 'muted small center' }, 'The host can start another round.'),
         h('button', { class: 'btn', onClick: goBack }, 'Back to home')),
   ];
+}
+
+/* =====================================================================
+   Security (family PIN) and phone names
+   ===================================================================== */
+
+const unlockKey = () => 'fdm:unlock:' + S.familyCode;
+function isUnlocked() {
+  try { return Number(sessionStorage.getItem(unlockKey()) || 0) > Date.now(); } catch { return false; }
+}
+function setUnlocked() {
+  try { sessionStorage.setItem(unlockKey(), String(Date.now() + 10 * 60 * 1000)); } catch { /* ignore */ }
+}
+
+function pinDialog({ title = 'Enter the family PIN', message, ok = 'Unlock' } = {}) {
+  return openModal((close) => {
+    const input = h('input', {
+      class: 'input pin-input', type: 'password', inputmode: 'numeric', autocomplete: 'off', maxlength: 8, placeholder: 'PIN', 'aria-label': 'PIN',
+    });
+    const err = h('div', { class: 'error-text' });
+    return h('form', {
+      onSubmit: (e) => {
+        e.preventDefault();
+        const v = input.value.trim();
+        if (!isValidPin(v)) { err.textContent = 'Enter 4 to 8 digits.'; input.focus(); return; }
+        close(v);
+      },
+    },
+    h('h2', {}, title),
+    message && h('p', { class: 'muted' }, message),
+    input, err,
+    h('div', { class: 'dialog-actions' },
+      h('button', { type: 'button', class: 'btn text', onClick: () => close(null) }, 'Cancel'),
+      h('button', { type: 'submit', class: 'btn primary' }, ok)));
+  }).then((v) => v ?? null);
+}
+
+async function askPin(message) {
+  const pin = await pinDialog({ message });
+  if (pin == null) return false;
+  if (await checkPin(S.family && S.family.security, pin)) { setUnlocked(); return true; }
+  toast('Wrong PIN.');
+  return false;
+}
+
+// True if the action may go ahead: not protected, unlocked recently on this phone, or the right PIN.
+async function guard(key) {
+  if (!needsPin(S.family && S.family.security, key) || isUnlocked()) return true;
+  return askPin('This is PIN protected. Once unlocked, this phone stays unlocked for 10 minutes.');
+}
+
+async function guardSecurity() {
+  const sec = S.family && S.family.security;
+  if (!sec || !sec.pinHash || isUnlocked()) return true;
+  return askPin('Enter the PIN to change security settings.');
+}
+
+// Per family (a phone can have a different name in each family). In demo mode
+// each tab is its own "phone", so the name is per tab there too.
+const phoneKey = () => 'phoneName:' + S.familyCode + (isDemo ? ':' + S.clientId : '');
+async function getPhoneName() {
+  const saved = prefs.get(phoneKey());
+  if (saved) return saved;
+  const name = await promptDialog({
+    title: 'Name this phone',
+    message: 'Tracker history shows which phone recorded each change. You can change it later in ⚙️ Settings.',
+    placeholder: "e.g. Dad's phone",
+    ok: 'Save',
+    validate: (n) => (n ? null : 'Enter a name.'),
+  });
+  const final = name || 'Unnamed phone';
+  prefs.set(phoneKey(), final);
+  return final;
+}
+
+function settingsBtn() {
+  return h('button', { class: 'icon-btn', 'aria-label': 'Settings', title: 'Settings', onClick: () => navigate('#/settings') }, '⚙️');
+}
+
+function homeTabs(active) {
+  return h('nav', { class: 'tabs', id: 'home-tabs' },
+    [['decide', '👑 Decide', '#/'], ['trackers', '📋 Trackers', '#/trackers']].map(([k, label, hash]) => h('button', {
+      class: 'tab' + (k === active ? ' on' : ''), 'data-key': 'tab-' + k, 'aria-pressed': String(k === active),
+      onClick: () => { if (k !== active) location.replace(hash); },
+    }, label)));
+}
+
+/* =====================================================================
+   Trackers: data
+   ===================================================================== */
+
+const trkSubs = new Map();
+
+function wantedTrackerIds() {
+  const r = S.route;
+  if (!S.family || !['trackers', 'tracker', 'trackerEdit', 'trackerStats'].includes(r.name)) return [];
+  const ids = new Set(S.family.trackers || []);
+  if (r.id && r.id !== 'new') ids.add(r.id);
+  return [...ids];
+}
+
+function syncTrackerSubs() {
+  if (!S.store) return;
+  const want = new Set(wantedTrackerIds());
+  for (const [id, off] of trkSubs) {
+    if (!want.has(id)) { off(); trkSubs.delete(id); delete S.trk[id]; }
+  }
+  for (const id of want) {
+    if (trkSubs.has(id)) continue;
+    S.trk[id] = undefined;
+    trkSubs.set(id, S.store.watch('trackers', id, (d) => { S.trk[id] = d; render(); }, (err) => {
+      S.trkError = err && err.code;
+      render();
+    }));
+  }
+}
+
+function personName(t, pid) {
+  const p = t.people.find((x) => x.id === pid);
+  if (!p) return '?';
+  const m = p.memberId && S.family && S.family.members.find((x) => x.id === p.memberId);
+  return m ? m.name : p.name;
+}
+const taskName = (t, id) => (t.tasks.find((x) => x.id === id) || {}).name || '?';
+
+function updateTracker(id, fn) {
+  return S.store.update('trackers', id, (cur) => {
+    if (!cur) throw new UserError('This tracker was deleted.');
+    const t = structuredClone(cur);
+    try {
+      fn(t);
+    } catch (e) {
+      if (e instanceof TrackerError) throw new UserError(e.message);
+      throw e;
+    }
+    return t;
+  });
+}
+
+async function trackerAction(id, key, fn, doneMessage) {
+  if (!(await guard(key))) return false;
+  const phone = await getPhoneName();
+  const ok = await run(() => updateTracker(id, (t) => fn(t, phone, Date.now())));
+  if (ok && doneMessage) toast(doneMessage);
+  return ok;
+}
+
+const fmt1 = (v) => {
+  const r = Math.round(v * 10) / 10;
+  return Number.isInteger(r) ? String(r) : r.toFixed(1);
+};
+
+function whenText(at) {
+  const d = new Date(at);
+  const days = (Date.now() - at) / 86400000;
+  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  if (days < 1 && d.getDate() === new Date().getDate()) return `Today ${time}`;
+  if (days < 6) return `${d.toLocaleDateString([], { weekday: 'short' })} ${time}`;
+  return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${time}`;
+}
+
+function describeEntry(t, e) {
+  const nm = (pid) => personName(t, pid);
+  const single = activeTasks(t).length === 1;
+  switch (e.type) {
+    case 'created': return '✨ Tracker created';
+    case 'edit': return '✏️ Tracker settings changed';
+    case 'undo': return `↩️ Undid: ${e.of}`;
+    case 'absent': return `🏕️ ${nm(e.person)} marked away`;
+    case 'back': return `🏠 ${nm(e.person)} is back`;
+    case 'swap': return `⇄ ${nm(e.a)} and ${nm(e.b)} swapped for this round`;
+    case 'penalty': {
+      const what = t.kind === 'privilege' ? `loses ${e.count} ${e.count === 1 ? 'turn' : 'turns'}` : `does ${e.count} extra ${e.count === 1 ? 'chore' : 'chores'}`;
+      return `⚠️ Penalty: ${nm(e.person)} ${what}${e.note ? ` (${e.note})` : ''}`;
+    }
+    case 'done': {
+      const did = (e.did || []).map((d) => (single ? nm(d.personId) : `${taskName(t, d.taskId)}: ${nm(d.personId)}`)).join(' · ') || 'Nobody';
+      const planned = e.planned && e.planned.length
+        ? ` (was ${e.planned.map((d) => (single ? nm(d.personId) : `${taskName(t, d.taskId)}: ${nm(d.personId)}`)).join(' · ')})`
+        : '';
+      const lost = (e.forfeits || []).length ? ` · ⏭️ ${e.forfeits.map((f) => nm(f.personId)).join(', ')} lost a turn` : '';
+      return `✓ Round ${e.round}: ${did}${planned}${lost}`;
+    }
+    default: return e.type;
+  }
+}
+
+function historyList(t, entries, idAttr) {
+  return h('ul', { class: 'list history', id: idAttr }, entries.map((e) => h('li', { class: e.undone ? 'undone' : '', 'data-key': 'h-' + e.id },
+    h('div', { class: 'grow' },
+      h('div', {}, describeEntry(t, e)),
+      h('div', { class: 'muted small' }, `${whenText(e.at)}${e.by ? ` · ${e.by}` : ''}${e.undone ? ' · undone' : ''}`)))));
+}
+
+/* =====================================================================
+   Trackers: screens
+   ===================================================================== */
+
+function rulesBanner() {
+  return h('div', { class: 'banner demo', id: 'rules-banner' }, h('span', {}, '⚠️'),
+    h('span', { class: 'grow small' }, 'Trackers need a one-time update to the Firebase rules. Paste the new rules from the README into Firebase (Firestore → Rules → Publish).'));
+}
+
+function trackersView() {
+  const ids = (S.family.trackers || []).filter((id) => S.trk[id] !== null);
+  return h('div', { class: 'screen', 'data-key': 'trackers' },
+    appBar('Trackers', { actions: [settingsBtn()] }),
+    homeTabs('trackers'),
+    h('main', { class: 'content' },
+      demoBanner(),
+      S.trkError === 'permission-denied' && rulesBanner(),
+      ids.length === 0 && h('section', { class: 'card center', id: 'trk-empty' },
+        h('div', { class: 'emoji-xl' }, '📋'),
+        h('p', {}, 'Keep turns fair over time: after-dinner jobs, who presses the elevator button, who picks the music…'),
+        h('p', { class: 'muted small' }, 'Each tracker remembers whose turn it is, rotates evenly, and keeps score.')),
+      ids.map((id) => trackerCard(id)),
+      h('button', { class: 'btn primary block big', id: 'new-tracker', onClick: onNewTracker }, '➕ New tracker')));
+}
+
+function trackerCard(id) {
+  const t = S.trk[id];
+  if (t === undefined) return h('section', { class: 'card', 'data-key': 'tc-' + id }, h('p', { class: 'muted' }, 'Loading…'));
+  const p = planRound(t);
+  const single = activeTasks(t).length === 1;
+  const lines = p.assignments.filter((a) => a.personId)
+    .map((a) => (single ? `${personName(t, a.personId)}'s turn` : `${taskName(t, a.taskId)}: ${personName(t, a.personId)}`));
+  return h('button', { class: 'card tracker-card', 'data-key': 'tc-' + id, onClick: () => navigate('#/tracker/' + id) },
+    h('span', { class: 'tracker-icon' }, t.icon),
+    h('span', { class: 'grow' },
+      h('strong', { class: 'block' }, t.name),
+      h('span', { class: 'muted small block' }, lines.join(' · ') || 'Nobody available')),
+    h('span', { class: 'chev', 'aria-hidden': 'true' }, '›'));
+}
+
+async function onNewTracker() {
+  if (await guard('trk.create')) navigate('#/tracker/new');
+}
+
+async function onEditTracker(id) {
+  if (await guard('trk.edit')) navigate(`#/tracker/${id}/edit`);
+}
+
+function trackerMissing() {
+  return messageView('trk-missing', 'Tracker not found', 'This tracker was deleted.', 'Back to trackers', () => location.replace('#/trackers'));
+}
+
+function trackerView(id) {
+  const t = S.trk[id];
+  if (t === undefined) return loadingView('trk-loading');
+  if (t === null) return trackerMissing();
+  const p = planRound(t);
+  const st = trkSettingsOf(t);
+  const tasks = activeTasks(t);
+  const single = tasks.length === 1;
+  const nameOf = (pid) => personName(t, pid);
+  const assigned = p.assignments.filter((a) => a.personId);
+  const undoLabel = lastUndoLabel(t);
+  const recent = (t.history || []).slice(-5).reverse();
+
+  return h('div', { class: 'screen', 'data-key': 'tracker-' + id },
+    appBar(`${t.icon} ${t.name}`, {
+      back: true,
+      actions: [
+        h('button', { class: 'icon-btn', 'aria-label': 'Charts and history', title: 'Charts and history', onClick: () => navigate(`#/tracker/${id}/stats`) }, '📊'),
+        h('button', { class: 'icon-btn', 'aria-label': 'Edit tracker', title: 'Edit', onClick: () => onEditTracker(id) }, '✏️'),
+      ],
+    }),
+    h('main', { class: 'content' },
+      demoBanner(),
+      h('section', { class: 'card now-card', id: 'now-card' },
+        h('div', { class: 'row' },
+          h('span', { class: 'muted small grow' }, `Round ${(t.round || 0) + 1}`),
+          h('span', { class: 'tag' }, t.kind === 'privilege' ? '🎉 Privilege' : '🧹 Chore')),
+        single
+          ? h('div', { class: 'now-big', id: 'now-who' },
+            assigned[0] ? `${nameOf(assigned[0].personId)}'s turn` : 'Nobody available',
+            h('div', { class: 'muted small' }, tasks[0].name + (assigned[0] && assigned[0].penalty ? ' · extra turn (penalty)' : '')))
+          : h('ul', { class: 'list now-list', id: 'now-list' }, p.assignments.map((a) => h('li', { 'data-key': 'na-' + a.taskId },
+            h('span', { class: 'grow' }, taskName(t, a.taskId)),
+            a.penalty && h('span', { class: 'tag warn-tag' }, 'penalty'),
+            h('strong', {}, a.personId ? nameOf(a.personId) : '—')))),
+        p.unassigned.length > 0 && h('p', { class: 'muted small' }, `Not assigned this round (more jobs than people): ${p.unassigned.map((x) => taskName(t, x)).join(', ')}`),
+        p.forfeits.length > 0 && h('p', { class: 'small', id: 'forfeit-note' }, '⏭️ ' + p.forfeits.map((f) => `${nameOf(f.personId)} loses this turn (penalty)`).join(' · ')),
+        !single && p.off.length > 0 && h('p', { class: 'muted small' }, `Off this round: ${p.off.map(nameOf).join(', ')}`),
+        p.absent.length > 0 && h('div', { class: 'chips', id: 'away-chips' }, p.absent.map((pid) => h('span', { class: 'chip', 'data-key': 'aw-' + pid },
+          `🏕️ ${nameOf(pid)} away`,
+          h('button', {
+            class: 'x', 'aria-label': `${nameOf(pid)} is back`, title: 'Mark back',
+            onClick: () => trackerAction(id, 'trk.absent', (tt, ph, now) => setAbsent(tt, pid, false, ph, now), `${nameOf(pid)} is back`),
+          }, '✕')))),
+        h('button', {
+          class: 'btn primary block big', id: 'trk-done', disabled: !assigned.length,
+          onClick: () => trackerAction(id, 'trk.done', (tt, ph, now) => completeRound(tt, null, ph, now), 'Recorded ✓'),
+        }, single && assigned[0] ? `✓ ${nameOf(assigned[0].personId)} did it` : '✓ Done'),
+        h('div', { class: 'action-row' },
+          h('button', { class: 'btn', id: 'trk-other', onClick: () => onRecordOther(id) }, single ? '🙋 Someone else did it' : '🙋 What really happened'),
+          h('button', { class: 'btn', id: 'trk-penalty', onClick: () => onPenalty(id) }, '⚠️ Penalty'),
+          h('button', { class: 'btn', id: 'trk-away', onClick: () => onAway(id) }, '🏕️ Away'),
+          activePeople(t).length > 1 && h('button', { class: 'btn', id: 'trk-swap', onClick: () => onSwap(id) }, '⇄ Swap'))),
+      st.preview && st.order !== 'random' && upNextCard(t),
+      fairnessCard(t),
+      undoLabel && h('button', { class: 'btn text block', id: 'trk-undo', onClick: () => onTrackerUndo(id, undoLabel) }, `↩️ Undo: ${undoLabel}`),
+      recent.length > 0 && h('section', { class: 'card', id: 'recent' },
+        h('div', { class: 'row' }, h('h2', { class: 'grow' }, 'Recent'),
+          h('button', { class: 'btn text small', onClick: () => navigate(`#/tracker/${id}/stats`) }, 'All history & charts')),
+        historyList(t, recent, 'recent-list'))));
+}
+
+function upNextCard(t) {
+  let next;
+  try { next = previewRounds(t, 3); } catch { return null; }
+  const single = activeTasks(t).length === 1;
+  const nameOf = (pid) => personName(t, pid);
+  return h('section', { class: 'card', id: 'up-next' },
+    h('h2', {}, 'Up next'),
+    single
+      ? h('div', { class: 'chips' }, next.map((p, i) => h('span', { class: 'chip', 'data-key': 'un' + i }, `${i + 1}. ${p.assignments[0] && p.assignments[0].personId ? nameOf(p.assignments[0].personId) : '—'}`)))
+      : h('ul', { class: 'list' }, next.map((p, i) => h('li', { 'data-key': 'un' + i },
+        h('span', { class: 'muted small' }, `Round ${p.round + 1}`),
+        h('span', { class: 'grow small' }, p.assignments.filter((a) => a.personId).map((a) => `${taskName(t, a.taskId)}: ${nameOf(a.personId)}`).join(' · '))))),
+    h('p', { class: 'muted small' }, 'If everything goes as planned. Penalties, swaps and "away" change it.'));
+}
+
+function fairnessCard(t) {
+  const rows = trkSummary(t);
+  const privilege = t.kind === 'privilege';
+  return h('section', { class: 'card', id: 'fairness' },
+    h('h2', {}, 'Fairness'),
+    h('ul', { class: 'list fair-list' }, rows.map((r) => {
+      const status = r.behind > 0.05 ? `owed ${fmt1(r.behind)}` : r.behind < -0.05 ? `ahead ${fmt1(-r.behind)}` : 'even';
+      return h('li', { 'data-key': 'f-' + r.id },
+        h('span', { class: 'grow' }, personName(t, r.id),
+          r.pending > 0 && h('span', { class: 'tag warn-tag' }, privilege ? `⏭️ ${r.pending} to lose` : `+${r.pending} extra`)),
+        h('span', { class: 'small muted' }, `${r.turns} ${r.turns === 1 ? 'turn' : 'turns'} · fair ${fmt1(r.share)}`),
+        h('span', { class: 'fair-status small ' + (status === 'even' ? '' : status.startsWith('owed') ? 'owed' : 'ahead') }, status));
+    })),
+    h('p', { class: 'muted small' }, trkSettingsOf(t).absence === 'owe'
+      ? 'Fair share = the turns each person would have if everything were perfectly even, including rounds they were away for.'
+      : 'Fair share = the turns each person would have if everything were perfectly even, counting only rounds they were here for.'));
+}
+
+function numberStepper(initial = 1) {
+  const input = h('input', { class: 'input step-input', type: 'number', inputmode: 'numeric', min: 1, max: 99, value: String(initial), 'aria-label': 'How many' });
+  const clamp = (v) => Math.max(1, Math.min(99, Math.floor(Number(v)) || 1));
+  const node = h('div', { class: 'stepper' },
+    h('button', { type: 'button', class: 'btn step', 'aria-label': 'Fewer', onClick: () => { input.value = clamp(Number(input.value) - 1); } }, '−'),
+    input,
+    h('button', { type: 'button', class: 'btn step', 'aria-label': 'More', onClick: () => { input.value = clamp(Number(input.value) + 1); } }, '+'));
+  return { node, value: () => clamp(input.value) };
+}
+
+function personSelect(t, people, value, emptyLabel) {
+  const sel = h('select', { class: 'input' },
+    emptyLabel && h('option', { value: '' }, emptyLabel),
+    people.map((p) => h('option', { value: p.id }, personName(t, p.id))));
+  sel.value = value || '';
+  return sel;
+}
+
+function penaltyHelp(t) {
+  if (t.kind !== 'privilege') return 'They do the next jobs, on top of their normal turns.';
+  return trkSettingsOf(t).catchUp
+    ? "Those turns are taken off their fair share for good, so they sit out until everyone else is ahead."
+    : "They're skipped that many times when it's their turn; the next person goes instead.";
+}
+
+function penaltyFields(t, people, withNone) {
+  const who = personSelect(t, people, '', withNone ? 'No penalty' : 'Who?');
+  const count = numberStepper(1);
+  const note = h('input', { class: 'input', placeholder: 'Reason (optional)', maxlength: 120, 'aria-label': 'Reason' });
+  const node = h('div', { class: 'stack penalty-fields' },
+    h('label', { class: 'field' }, h('span', { class: 'small muted' }, 'Who'), who),
+    h('label', { class: 'field' }, h('span', { class: 'small muted' }, t.kind === 'privilege' ? 'Turns to lose' : 'Extra chores'), count.node),
+    note,
+    h('p', { class: 'muted small' }, penaltyHelp(t)));
+  return { node, read: () => (who.value ? { pid: who.value, count: count.value(), note: note.value } : null) };
+}
+
+async function onRecordOther(id) {
+  const t = S.trk[id];
+  if (!t) return;
+  const p = planRound(t);
+  const people = activePeople(t);
+  const tasks = activeTasks(t);
+  const single = tasks.length === 1;
+  const res = await openModal((close) => {
+    const rows = tasks.map((task) => {
+      const a = p.assignments.find((x) => x.taskId === task.id);
+      const sel = personSelect(t, people, a && a.personId, '— nobody —');
+      return { task, sel, node: h('label', { class: 'field' }, h('span', { class: 'small muted' }, single ? 'Did it' : task.name), sel) };
+    });
+    const pen = penaltyFields(t, people, true);
+    const err = h('div', { class: 'error-text' });
+    return h('form', {
+      onSubmit: (e) => {
+        e.preventDefault();
+        const actual = rows.filter((r) => r.sel.value).map((r) => ({ taskId: r.task.id, personId: r.sel.value }));
+        if (!actual.length) { err.textContent = 'Pick who did it.'; return; }
+        close({ actual, penalty: pen.read() });
+      },
+    },
+    h('h2', {}, single ? 'Who actually did it?' : 'What really happened?'),
+    h('p', { class: 'muted small' }, 'They get the credit. If it was someone else\'s turn, that person keeps their place.'),
+    h('div', { class: 'stack' }, rows.map((r) => r.node)),
+    h('h3', { class: 'sub-head' }, '⚠️ Penalty (optional)'),
+    pen.node,
+    err,
+    h('div', { class: 'dialog-actions' },
+      h('button', { type: 'button', class: 'btn text', onClick: () => close(null) }, 'Cancel'),
+      h('button', { type: 'submit', class: 'btn primary' }, 'Save')));
+  });
+  if (!res) return;
+  if (!(await guard('trk.actual'))) return;
+  if (res.penalty && !(await guard('trk.penalty'))) return;
+  const phone = await getPhoneName();
+  const ok = await run(() => updateTracker(id, (tt) => {
+    completeRound(tt, res.actual, phone, Date.now());
+    if (res.penalty) penalize(tt, res.penalty.pid, res.penalty.count, res.penalty.note, phone, Date.now());
+  }));
+  if (ok) toast(res.penalty ? 'Recorded, with a penalty' : 'Recorded ✓');
+}
+
+async function onPenalty(id) {
+  const t = S.trk[id];
+  if (!t) return;
+  const res = await openModal((close) => {
+    const pen = penaltyFields(t, activePeople(t), false);
+    const err = h('div', { class: 'error-text' });
+    return h('form', {
+      onSubmit: (e) => {
+        e.preventDefault();
+        const v = pen.read();
+        if (!v) { err.textContent = 'Pick who gets the penalty.'; return; }
+        close(v);
+      },
+    },
+    h('h2', {}, '⚠️ Give a penalty'),
+    pen.node, err,
+    h('div', { class: 'dialog-actions' },
+      h('button', { type: 'button', class: 'btn text', onClick: () => close(null) }, 'Cancel'),
+      h('button', { type: 'submit', class: 'btn danger' }, 'Give penalty')));
+  });
+  if (res) trackerAction(id, 'trk.penalty', (tt, ph, now) => penalize(tt, res.pid, res.count, res.note, ph, now), 'Penalty recorded');
+}
+
+async function onAway(id) {
+  const t = S.trk[id];
+  if (!t) return;
+  const away = new Set((t.roundInfo && t.roundInfo.absent) || []);
+  const res = await openModal((close) => {
+    const boxes = activePeople(t).map((p) => {
+      const box = h('input', { type: 'checkbox', checked: away.has(p.id) });
+      return { p, box, node: h('label', { class: 'check-row' }, box, h('span', {}, personName(t, p.id))) };
+    });
+    return h('form', { onSubmit: (e) => { e.preventDefault(); close(boxes.map((b) => [b.p.id, b.box.checked])); } },
+      h('h2', {}, '🏕️ Who is away?'),
+      h('p', { class: 'muted small' }, trkSettingsOf(t).absence === 'owe'
+        ? 'People stay away until you uncheck them. They make up missed turns when they\'re back (with Catch-up on).'
+        : 'People stay away until you uncheck them. Turns they miss are skipped.'),
+      h('div', { class: 'stack' }, boxes.map((b) => b.node)),
+      h('div', { class: 'dialog-actions' },
+        h('button', { type: 'button', class: 'btn text', onClick: () => close(null) }, 'Cancel'),
+        h('button', { type: 'submit', class: 'btn primary' }, 'Save')));
+  });
+  if (!res) return;
+  const changes = res.filter(([pid, on]) => away.has(pid) !== on);
+  if (changes.length) trackerAction(id, 'trk.absent', (tt, ph, now) => changes.forEach(([pid, on]) => setAbsent(tt, pid, on, ph, now)), 'Saved');
+}
+
+async function onSwap(id) {
+  const t = S.trk[id];
+  if (!t) return;
+  const p = planRound(t);
+  const people = activePeople(t).filter((x) => !p.absent.includes(x.id));
+  const first = p.assignments.find((a) => a.personId);
+  const res = await openModal((close) => {
+    const a = personSelect(t, people, first && first.personId, null);
+    const b = personSelect(t, people, (people.find((x) => !first || x.id !== first.personId) || {}).id, null);
+    const err = h('div', { class: 'error-text' });
+    return h('form', {
+      onSubmit: (e) => {
+        e.preventDefault();
+        if (a.value === b.value) { err.textContent = 'Pick two different people.'; return; }
+        close([a.value, b.value]);
+      },
+    },
+    h('h2', {}, '⇄ Swap this round'),
+    h('p', { class: 'muted small' }, 'The two trade places for this round only. Each gets credit for what they actually do.'),
+    h('div', { class: 'stack' }, a, h('div', { class: 'center muted' }, 'trades with'), b),
+    err,
+    h('div', { class: 'dialog-actions' },
+      h('button', { type: 'button', class: 'btn text', onClick: () => close(null) }, 'Cancel'),
+      h('button', { type: 'submit', class: 'btn primary' }, 'Swap')));
+  });
+  if (res) trackerAction(id, 'trk.swap', (tt, ph, now) => swapJobs(tt, res[0], res[1], ph, now), 'Swapped for this round');
+}
+
+async function onTrackerUndo(id, label) {
+  const ok = await confirmDialog({ title: `Undo "${label}"?`, message: 'This puts the tracker back the way it was before. The history keeps a note of it.', ok: 'Undo' });
+  if (ok) trackerAction(id, 'trk.undo', (tt, ph, now) => undoTracker(tt, ph, now), 'Undone');
+}
+
+/* ---------- create / edit ---------- */
+
+const TRACKER_ICONS = ['📋', '🛗', '🍽️', '🧹', '🧺', '🗑️', '🚗', '🐶', '🛁', '🎮', '📺', '🎵', '🛒', '🌱'];
+
+function draftFrom(t) {
+  if (!t) return { name: '', icon: '📋', kind: 'chore', people: [], tasks: [], settings: { ...TRK_DEFAULTS } };
+  return {
+    name: t.name, icon: t.icon, kind: t.kind,
+    people: activePeople(t).map((p) => ({ id: p.id, name: personName(t, p.id), memberId: p.memberId || null })),
+    tasks: activeTasks(t).map((x) => ({ id: x.id, name: x.name })),
+    settings: { ...trkSettingsOf(t) },
+  };
+}
+
+function draftSeg(d, key, value, choices) {
+  const inSettings = key in TRK_DEFAULTS;
+  return h('div', { class: 'seg', role: 'group' }, choices.map(([v, label]) => h('button', {
+    type: 'button', class: v === value ? 'on' : '', 'data-key': `${key}-${v}`, 'aria-pressed': String(v === value),
+    onClick: () => { if (inSettings) d.settings[key] = v; else d[key] = v; render(); },
+  }, label)));
+}
+
+function moveItem(list, i, delta) {
+  const j = i + delta;
+  if (j < 0 || j >= list.length) return;
+  [list[i], list[j]] = [list[j], list[i]];
+  render();
+}
+
+function trackerEditView(id) {
+  const isNew = id === 'new';
+  const t = isNew ? null : S.trk[id];
+  if (!isNew && t === undefined) return loadingView('trk-loading');
+  if (!isNew && t === null) return trackerMissing();
+  if (!S.trkDraft || S.trkDraft.for !== id) S.trkDraft = { for: id, ...draftFrom(t) };
+  const d = S.trkDraft;
+  const st = d.settings;
+  const taken = (name) => d.people.some((p) => p.name.toLowerCase() === name.toLowerCase());
+  const reuseId = (match) => {
+    const old = t && t.people.find((p) => p.active === false && match(p));
+    return old ? old.id : uid();
+  };
+  const familyLeft = S.family.members.filter((m) => !d.people.some((p) => p.memberId === m.id) && !taken(m.name));
+  const addWriteIn = (e) => {
+    e.preventDefault();
+    const input = document.getElementById('trk-person');
+    const n = input.value.trim();
+    const err = nameError(n, d.people.map((p) => p.name));
+    if (err) { toast(err); return; }
+    d.people.push({ id: reuseId((p) => !p.memberId && p.name.toLowerCase() === n.toLowerCase()), name: n, memberId: null });
+    input.value = '';
+    render();
+  };
+  const addTask = (e) => {
+    e.preventDefault();
+    const input = document.getElementById('trk-task');
+    const n = input.value.trim().slice(0, 40);
+    if (!n) return;
+    if (d.tasks.some((x) => x.name.toLowerCase() === n.toLowerCase())) { toast(`"${n}" is already a job.`); return; }
+    const old = t && t.tasks.find((x) => x.active === false && x.name.toLowerCase() === n.toLowerCase());
+    d.tasks.push({ id: old ? old.id : uid(), name: n });
+    input.value = '';
+    render();
+  };
+  const renameTask = async (task) => {
+    const n = await promptDialog({ title: 'Rename job', value: task.name, placeholder: 'Job', validate: (v) => (!v ? 'Enter a name.' : d.tasks.some((x) => x !== task && x.name.toLowerCase() === v.toLowerCase()) ? 'That job already exists.' : null) });
+    if (n) { task.name = n; render(); }
+  };
+  const ready = d.name.trim() && d.people.length && d.tasks.length;
+
+  return h('div', { class: 'screen', 'data-key': 'trk-edit-' + id },
+    appBar(isNew ? 'New tracker' : 'Edit tracker', { back: true }),
+    h('main', { class: 'content' },
+      h('section', { class: 'card', id: 'edit-name' },
+        h('h2', {}, 'Name'),
+        h('input', { id: 'trk-name', class: 'input', value: d.name, placeholder: 'e.g. Elevator button', maxlength: 40, 'aria-label': 'Tracker name', onInput: (e) => { d.name = e.target.value; } }),
+        h('div', { class: 'chips icon-chips' }, TRACKER_ICONS.map((ic) => h('button', {
+          type: 'button', class: 'chip' + (ic === d.icon ? ' current' : ''), 'data-key': 'ic-' + ic, 'aria-label': `Icon ${ic}`,
+          onClick: () => { d.icon = ic; render(); },
+        }, ic))),
+        setting('Type', draftSeg(d, 'kind', d.kind, [['chore', '🧹 Chore'], ['privilege', '🎉 Privilege']])),
+        h('p', { class: 'muted small' }, TRK_KINDS[d.kind].desc)),
+
+      h('section', { class: 'card', id: 'edit-people' },
+        h('h2', {}, `People (${d.people.length})`),
+        d.people.length > 0 && h('ul', { class: 'list' }, d.people.map((p, i) => h('li', { 'data-key': 'ep-' + p.id },
+          h('span', { class: 'muted small' }, i + 1),
+          h('span', { class: 'grow' }, p.name),
+          !p.memberId && h('span', { class: 'tag muted-tag' }, 'write-in'),
+          h('button', { type: 'button', class: 'icon-btn sm', 'aria-label': `Move ${p.name} up`, disabled: i === 0, onClick: () => moveItem(d.people, i, -1) }, '↑'),
+          h('button', { type: 'button', class: 'icon-btn sm', 'aria-label': `Move ${p.name} down`, disabled: i === d.people.length - 1, onClick: () => moveItem(d.people, i, 1) }, '↓'),
+          h('button', { type: 'button', class: 'icon-btn sm', 'aria-label': `Remove ${p.name}`, onClick: () => { d.people.splice(i, 1); render(); } }, '×')))),
+        familyLeft.length > 0 && h('div', { class: 'chips' }, familyLeft.map((m) => h('button', {
+          type: 'button', class: 'chip', 'data-key': 'fm-' + m.id,
+          onClick: () => { d.people.push({ id: reuseId((p) => p.memberId === m.id), name: m.name, memberId: m.id }); render(); },
+        }, '+ ' + m.name))),
+        h('form', { class: 'row', onSubmit: addWriteIn },
+          h('input', { id: 'trk-person', class: 'input', placeholder: 'Someone else', maxlength: 30, autocomplete: 'off', 'aria-label': 'Add someone else' }),
+          h('button', { class: 'btn', type: 'submit' }, 'Add')),
+        h('p', { class: 'muted small' }, 'The order here is the rotation order. Removing someone keeps their past stats.')),
+
+      h('section', { class: 'card', id: 'edit-tasks' },
+        h('h2', {}, `Jobs (${d.tasks.length})`),
+        d.tasks.length > 0 && h('ul', { class: 'list' }, d.tasks.map((x, i) => h('li', { 'data-key': 'et-' + x.id },
+          h('button', { type: 'button', class: 'link-btn grow', title: 'Rename', onClick: () => renameTask(x) }, x.name),
+          h('button', { type: 'button', class: 'icon-btn sm', 'aria-label': `Move ${x.name} up`, disabled: i === 0, onClick: () => moveItem(d.tasks, i, -1) }, '↑'),
+          h('button', { type: 'button', class: 'icon-btn sm', 'aria-label': `Move ${x.name} down`, disabled: i === d.tasks.length - 1, onClick: () => moveItem(d.tasks, i, 1) }, '↓'),
+          h('button', { type: 'button', class: 'icon-btn sm', 'aria-label': `Remove ${x.name}`, onClick: () => { d.tasks.splice(i, 1); render(); } }, '×')))),
+        h('form', { class: 'row', onSubmit: addTask },
+          h('input', { id: 'trk-task', class: 'input', placeholder: 'e.g. Dishes, or Press the button', maxlength: 40, autocomplete: 'off', 'aria-label': 'Add a job' }),
+          h('button', { class: 'btn', type: 'submit' }, 'Add')),
+        h('p', { class: 'muted small' }, 'One job (like the elevator button) means one person each time. Tap a job to rename it. Jobs at the top are filled first.')),
+
+      h('section', { class: 'card', id: 'edit-rotation' },
+        h('h2', {}, 'Rotation'),
+        setting('Order', draftSeg(d, 'order', st.order, Object.entries(TRK_ORDERS).map(([k, v]) => [k, v.label]))),
+        h('p', { class: 'muted small' }, TRK_ORDERS[st.order].desc),
+        setting('Catch-up', draftSeg(d, 'catchUp', st.catchUp, [[false, 'Off'], [true, 'On']])),
+        h('p', { class: 'muted small' }, 'Whoever is furthest behind their fair share goes first. Evens things out after steals, swaps, time away and penalties.'),
+        setting('When someone is away', draftSeg(d, 'absence', st.absence, [['skip', 'Their turns are skipped'], ['owe', 'They make them up']])),
+        st.absence === 'owe' && !st.catchUp && h('p', { class: 'error-text' }, 'Making up turns needs Catch-up on.'),
+        d.tasks.length > 1 && setting('More jobs than people', draftSeg(d, 'extraJobs', st.extraJobs, [['one', 'One job each (extras wait)'], ['all', 'Assign every job']])),
+        setting('Show "Up next"', draftSeg(d, 'preview', st.preview, [[true, 'Show'], [false, 'Hide']]))),
+
+      h('div', { class: 'stack' },
+        h('button', { class: 'btn primary block big', id: 'trk-save', disabled: !ready, onClick: () => onSaveTracker(id) },
+          ready ? (isNew ? 'Create tracker' : 'Save changes') : 'Add a name, people and jobs'),
+        h('button', { class: 'btn text', onClick: () => { S.trkDraft = null; goBack(); } }, 'Cancel'),
+        !isNew && h('button', { class: 'btn text danger-text', id: 'trk-delete', onClick: () => onDeleteTracker(id) }, 'Delete tracker'))));
+}
+
+async function onSaveTracker(id) {
+  const d = S.trkDraft;
+  const isNew = id === 'new';
+  const input = document.getElementById('trk-name');
+  if (input) d.name = input.value;
+  const fields = { name: d.name.trim(), icon: d.icon, kind: d.kind, people: d.people, tasks: d.tasks, settings: d.settings };
+  if (!(await guard(isNew ? 'trk.create' : 'trk.edit'))) return;
+  const phone = await getPhoneName();
+  if (isNew) {
+    let doc;
+    try {
+      doc = newTracker({ family: S.familyCode, ...fields }, crypto.getRandomValues(new Uint32Array(1))[0]);
+    } catch (e) {
+      toast(e.message);
+      return;
+    }
+    doc.seq = 1;
+    doc.history = [{ id: 1, at: Date.now(), by: phone, type: 'created' }];
+    const tid = uid();
+    const ok = await run(async () => {
+      await S.store.update('trackers', tid, (cur) => { if (cur) throw new UserError('Please try again.'); return doc; });
+      await updateFamily((f) => { f.trackers = [...(f.trackers || []), tid]; });
+    });
+    if (ok) {
+      S.trkDraft = null;
+      location.replace('#/tracker/' + tid);
+    }
+  } else {
+    const ok = await run(() => updateTracker(id, (t) => editTracker(t, fields, phone, Date.now())));
+    if (ok) {
+      S.trkDraft = null;
+      toast('Saved');
+      goBack();
+    }
+  }
+}
+
+async function onDeleteTracker(id) {
+  if (!(await guard('trk.delete'))) return;
+  const t = S.trk[id];
+  const ok = await confirmDialog({
+    title: `Delete ${t ? t.name : 'this tracker'}?`,
+    message: 'Its history and stats will be gone for everyone. This can\'t be undone.',
+    ok: 'Delete', danger: true,
+  });
+  if (!ok) return;
+  const done = await run(async () => {
+    await S.store.update('trackers', id, () => null);
+    await updateFamily((f) => { f.trackers = (f.trackers || []).filter((x) => x !== id); });
+  });
+  if (done) {
+    S.trkDraft = null;
+    location.replace('#/trackers');
+  }
+}
+
+/* ---------- charts & history ---------- */
+
+function trackerStatsView(id) {
+  const t = S.trk[id];
+  if (t === undefined) return loadingView('trk-loading');
+  if (t === null) return trackerMissing();
+  const rows = trkSummary(t);
+  const tasks = activeTasks(t);
+  const nameOf = (pid) => personName(t, pid);
+  const colorOf = (pid) => seriesColor(t.people.findIndex((p) => p.id === pid));
+  let tl = timeline(t);
+  if (tl.length > 300) {
+    const step = Math.ceil(tl.length / 300);
+    tl = tl.filter((_, i) => i % step === 0 || i === tl.length - 1);
+  }
+  const shown = rows.slice(0, MAX_SERIES);
+  const privilege = t.kind === 'privilege';
+  const hist = (t.history || []).slice().reverse();
+
+  return h('div', { class: 'screen', 'data-key': 'tracker-stats-' + id },
+    appBar(`📊 ${t.name}`, { back: true }),
+    h('main', { class: 'content' },
+      h('section', { class: 'card center' },
+        h('div', { class: 'stat-total' }, t.round || 0),
+        h('div', { class: 'muted small' }, (t.round || 0) === 1 ? 'round recorded' : 'rounds recorded')),
+      barChart({
+        id: 'chart-fair', title: 'Turns vs fair share',
+        subtitle: 'Bars are real turns; the line is each person\'s fair share.',
+        rows: rows.map((r) => ({ key: r.id, label: nameOf(r.id), value: r.turns, marker: Math.max(0, r.share) })),
+        unit: 'turns', markerLabel: 'Fair share',
+      }),
+      tasks.length > 1 && stackedBarChart({
+        id: 'chart-jobs', title: 'Turns by job',
+        rows: rows.map((r) => ({ key: r.id, label: nameOf(r.id), parts: r.byTask })),
+        series: tasks.slice(0, MAX_SERIES).map((x) => ({ key: x.id, label: x.name })),
+        unit: 'turns',
+      }),
+      tl.length > 1 && lineChart({
+        id: 'chart-time', title: 'Turns over time', subtitle: 'Running total of real turns per person.',
+        series: shown.map((r) => ({ key: r.id, label: nameOf(r.id), color: colorOf(r.id) })),
+        points: tl.map((pt, i) => ({ label: i === 0 ? 'Start' : `Round ${pt.round}`, values: pt.values })),
+        unit: 'Turns',
+      }),
+      rows.some((r) => r.penalties > 0) && barChart({
+        id: 'chart-penalties', title: 'Penalties',
+        subtitle: privilege ? 'Turns lost to penalties.' : 'Extra chores given as penalties.',
+        rows: rows.map((r) => ({ key: r.id, label: nameOf(r.id), value: r.penaltyTurns, penalties: r.penalties })),
+        unit: privilege ? 'turns lost' : 'extra chores',
+        readoutFor: (r) => `${r.label}: ${r.penalties} ${r.penalties === 1 ? 'penalty' : 'penalties'}, ${r.value} ${privilege ? 'turns lost' : 'extra chores'}`,
+      }),
+      h('section', { class: 'card', id: 'history' },
+        h('h2', {}, 'History'),
+        hist.length ? historyList(t, hist.slice(0, 300), 'history-list') : h('p', { class: 'muted small' }, 'Nothing yet.'),
+        hist.length > 300 && h('p', { class: 'muted small' }, `Showing the latest 300 of ${hist.length}.`))));
+}
+
+/* ---------- settings ---------- */
+
+function settingsView() {
+  const sec = S.family.security || {};
+  const protect = sec.protect || {};
+  const preset = matchingPreset(protect);
+  const phone = prefs.get(phoneKey());
+  return h('div', { class: 'screen', 'data-key': 'settings' },
+    appBar('Settings', { back: true }),
+    h('main', { class: 'content' },
+      h('section', { class: 'card', id: 'set-phone' },
+        h('h2', {}, '📱 This phone'),
+        h('div', { class: 'row' },
+          h('span', { class: 'grow' }, phone || h('span', { class: 'muted' }, 'Not named yet')),
+          h('button', { class: 'btn', id: 'rename-phone', onClick: onRenamePhone }, phone ? 'Change' : 'Name it')),
+        h('p', { class: 'muted small' }, 'Shown in tracker history. If this phone is in more than one family, each can have its own name.')),
+      h('section', { class: 'card', id: 'set-family' },
+        h('h2', {}, '👪 Family'),
+        h('div', { class: 'row' },
+          h('span', { class: 'grow' }, 'Family code ', h('strong', {}, S.familyCode)),
+          h('button', { class: 'btn', onClick: familyDialog }, 'Invite…'))),
+      h('section', { class: 'card', id: 'set-security' },
+        h('h2', {}, '🔒 Security'),
+        sec.pinHash
+          ? h('div', { class: 'row wrap' },
+            h('span', { class: 'grow' }, '🔒 PIN on'),
+            h('button', { class: 'btn', id: 'change-pin', onClick: onSetPin }, 'Change PIN'),
+            h('button', { class: 'btn text danger-text', id: 'remove-pin', onClick: onRemovePin }, 'Remove'))
+          : h('div', { class: 'stack' },
+            h('p', { class: 'muted small' }, 'No PIN yet, so nothing is protected. Set a PIN, then choose what it protects.'),
+            h('button', { class: 'btn primary', id: 'set-pin', onClick: onSetPin }, 'Set a PIN')),
+        setting('Protection level', h('div', { class: 'seg', role: 'group' }, Object.entries(PRESETS).map(([k, v]) => h('button', {
+          class: k === preset ? 'on' : '', 'data-key': 'preset-' + k, 'aria-pressed': String(k === preset), onClick: () => onPreset(k),
+        }, v.label)))),
+        !preset && h('p', { class: 'muted small' }, 'Custom: your own mix below.'),
+        SECTIONS.map((sect) => h('div', { class: 'protect-section', 'data-key': 'ps-' + sect.id },
+          h('h3', { class: 'sub-head' }, sect.label),
+          sect.items.map(([key, label]) => h('label', { class: 'check-row', 'data-key': 'pk-' + key },
+            h('input', { type: 'checkbox', checked: !!protect[key], onChange: (e) => onToggleProtect(key, e.target.checked) }),
+            h('span', {}, label))))),
+        h('p', { class: 'muted small' }, 'Once someone enters the PIN, that phone stays unlocked for 10 minutes. Forgot the PIN? See "Forgot the PIN" in the README.'))));
+}
+
+async function onRenamePhone() {
+  const n = await promptDialog({ title: 'Name this phone', value: prefs.get(phoneKey()) || '', placeholder: "e.g. Dad's phone", validate: (v) => (v ? null : 'Enter a name.') });
+  if (n) { prefs.set(phoneKey(), n); render(); }
+}
+
+async function onSetPin() {
+  if (!(await guardSecurity())) return;
+  const pin = await pinDialog({ title: 'Choose a PIN', message: '4 to 8 digits. Share it only with the grown-ups.', ok: 'Next' });
+  if (pin == null) return;
+  const again = await pinDialog({ title: 'Enter it again', ok: 'Save PIN' });
+  if (again == null) return;
+  if (again !== pin) { toast("The PINs didn't match. Try again."); return; }
+  const salt = newSalt();
+  const pinHash = await hashPin(pin, salt);
+  if (await run(() => updateFamily((f) => { f.security = { ...(f.security || {}), pinHash, salt }; }))) {
+    setUnlocked();
+    toast('PIN saved');
+  }
+}
+
+async function onRemovePin() {
+  if (!(await askPin('Enter the current PIN to remove it.'))) return;
+  if (await run(() => updateFamily((f) => {
+    if (f.security) { delete f.security.pinHash; delete f.security.salt; }
+  }))) toast('PIN removed. Nothing is protected now.');
+}
+
+async function onPreset(name) {
+  if (!(await guardSecurity())) return;
+  run(() => updateFamily((f) => { f.security = { ...(f.security || {}), protect: presetProtect(name) }; }));
+}
+
+async function onToggleProtect(key, on) {
+  if (!(await guardSecurity())) { render(); return; }
+  run(() => updateFamily((f) => {
+    const protect = { ...((f.security && f.security.protect) || {}) };
+    if (on) protect[key] = true; else delete protect[key];
+    f.security = { ...(f.security || {}), protect };
+  })).then(() => render());
 }
 
 /* ---------- top-level render ---------- */
@@ -2029,6 +2900,11 @@ function currentView() {
       `The family with code ${S.familyCode} no longer exists.`, 'Start over', leaveFamily);
   }
   if (r.name === 'stats') return statsView();
+  if (r.name === 'trackers') return trackersView();
+  if (r.name === 'tracker') return trackerView(r.id);
+  if (r.name === 'trackerEdit') return trackerEditView(r.id);
+  if (r.name === 'trackerStats') return trackerStatsView(r.id);
+  if (r.name === 'settings') return settingsView();
   return homeView();
 }
 
