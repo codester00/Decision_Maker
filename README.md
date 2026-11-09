@@ -20,6 +20,7 @@ Group decisions on everyone's phones. They are completely separate from the prio
 
 1. **Players.** Family members tap the banner on their home screen (or enter the game code / open the shared link) and add themselves. One phone can add several people (for example, kids without phones), but each person plays from only one phone. Minimum 2 players. **Latecomers can join at any point:** mid-Elimination they go to the end of the turn order; mid-vote they vote in the current round.
 2. **Options.** Everyone adds options from their own phone at the same time. By default **each phone sees only its own options** (plus a count of the others) until the decision starts; the host can switch to showing everyone's, which also lets the host remove any option. When the decision starts, options are shuffled so their order doesn't hint at who added them.
+   - **🔍 Find restaurants, activities & movies** searches near your location (or a city/ZIP you type): restaurants by cuisine, activities by type (parks, museums, bowling, mini golf, theaters and more), within 1–25 miles. Tap **+ Add** to add a result as your option. Place data comes from OpenStreetMap: free, no account needed, but it has no ratings and coverage varies by area. **Movies now playing** needs a free TMDB key (see below).
 3. **Method.** The host picks how to decide (everyone sees the choice live) and starts:
 
 | Method | How it works | Host settings |
@@ -71,6 +72,12 @@ On the live site you can also add `?demo` to the address (https://codester00.git
 5. **Project settings (⚙️) → General → Your apps → Web (`</>`)**: register an app (Firebase Hosting is not needed) and copy the `firebaseConfig` object.
 6. Paste that object into [`js/firebase-config.js`](js/firebase-config.js) in place of `null`. The values are not secret; the rules protect the data.
 
+### Optional: movies now playing (TMDB)
+1. Create a free account at https://www.themoviedb.org/signup and confirm your email.
+2. Go to https://www.themoviedb.org/settings/api, click **Create** (or "click here" under *Request an API Key*), choose **Developer**, and accept the terms.
+3. Fill in the form. For the application name use `Family Decision Maker`, for the URL use your GitHub Pages link, and for the summary use "Family app that suggests movies now playing as options". Submit.
+4. Copy the **API Key** (the shorter one) and paste it into `js/api-keys.js` in place of `null`, in quotes: `export const tmdbKey = "your key here";`, or just send it to Claude to add. Like the Firebase config, it ends up visible in the browser; the worst anyone could do with it is use up your free TMDB quota.
+
 ### 3. Put it online with GitHub Pages
 1. Commit and push to `main`.
 2. In GitHub: **Settings → Pages → Build and deployment → Deploy from a branch → `main` / `(root)` → Save.**
@@ -85,6 +92,8 @@ On the live site you can also add `?demo` to the address (https://codester00.git
 | `css/styles.css` | Styles (mobile-first, light and dark mode) |
 | `js/app.js` | Screens and actions |
 | `js/methods.js` | Rules for each decision method (pure logic) |
+| `js/places.js` | Find nearby: OpenStreetMap place search, city lookup, TMDB movies |
+| `js/api-keys.js` | Optional keys (TMDB) |
 | `js/store.js` | Data layer: Firestore, or localStorage in demo mode |
 | `js/firebase-config.js` | Your Firebase web config |
 | `firestore.rules` | Firestore security rules |

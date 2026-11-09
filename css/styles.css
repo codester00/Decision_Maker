@@ -378,6 +378,26 @@ button.chip:hover { border-color: var(--primary); }
 .match-pick { margin-bottom: 14px; }
 .match-pick .choices { margin: 6px 0 0; }
 
+/* find nearby */
+.finder-btn { margin-top: 10px; }
+#finder-head { margin-bottom: 6px; }
+.finder-tabs { margin-bottom: 12px; }
+.loc-form .row { margin-top: 6px; }
+.sub-chips { margin: 0 -16px; padding: 2px 16px 6px; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+.sub-chips::-webkit-scrollbar { display: none; }
+.sub-chips .chip { flex: none; }
+.finder-tabs { flex-wrap: nowrap; }
+.finder-tabs button { flex: 1 1 0; padding: 6px 4px; white-space: nowrap; }
+.sub-chips .chip { min-height: 36px; font-size: .9rem; }
+.finder-status { padding: 18px 0 8px; }
+.spinner.inline { margin: 0 auto 8px; width: 28px; height: 28px; }
+.results { margin-top: 12px; }
+.results li { min-height: 56px; gap: 12px; }
+.result-name { font-weight: 600; overflow-wrap: anywhere; }
+.add-btn { min-height: 38px; padding: 6px 12px; flex: none; }
+.poster { width: 40px; height: 60px; border-radius: 6px; object-fit: cover; background: var(--surface-2); flex: none; }
+.attribution { margin: 14px 0 0; font-size: .75rem; }
+
 /* ---------- dialogs & toasts ---------- */
 .overlay {
   position: fixed;

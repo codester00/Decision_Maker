@@ -4,6 +4,9 @@ import {
   normalizeGame, startPlay, currentPlayer, eliminate, spin, applyBallot, resolveBallots, breakTie,
   resetToOptions, resetToLobby, ballotRound, openMatches,
 } from './methods.js';
+import {
+  CATEGORIES, RADII, unitLabel, formatDistance, searchPlaces, geocode, locateMe, moviesEnabled, nowPlaying,
+} from './places.js';
 
 const $app = document.getElementById('app');
 const $modal = document.getElementById('modal-root');
@@ -260,6 +263,7 @@ const S = {
   elimPending: null, // Elimination: option this phone just knocked out (hidden right away)
   playFor: null, // Elimination: host chose to play a stuck player's turn
   showAddPlayer: null, // game code where the "add another player" form is open
+  finder: null, // Find nearby panel state (options phase)
   ballotFor: null, // which of this phone's players is filling in a ballot
   draft: null, // the ballot being filled in (local until submitted)
   reveal: null, // ranked-choice round reveal progress
@@ -1101,6 +1105,7 @@ function gameView() {
         'Back to home', goBack);
   }
   const isHost = g.host === S.clientId;
+  if (g.phase !== 'options' && S.finder) S.finder = null;
   const M = METHODS[g.method] || METHODS.elimination;
   const titles = { lobby: '🎲 Players', options: '🎲 Options', play: `${M.icon} ${M.label}`, tiebreak: '👑 Tie-break', winner: '🎉 Decision made!' };
   const phaseView = { lobby: lobbyPhase, options: optionsPhase, play: playPhase, tiebreak: tiebreakPhase, winner: winnerPhase }[g.phase];
@@ -1205,6 +1210,7 @@ function optionsPhase(g, isHost) {
     rememberMyOption(id); // before saving, so this phone shows it as soon as it arrives
     run(() => addOption(id, text)).then((ok) => { if (!ok && !input.value) input.value = text; });
   };
+  if (S.finder && S.finder.code === S.route.code) return finderView(g);
   const need = minOptions(g);
   const M = METHODS[g.method];
   const show = settingsOf(g).showOptions;
@@ -1219,6 +1225,7 @@ function optionsPhase(g, isHost) {
       h('form', { class: 'row', onSubmit: submitOption },
         h('input', { id: 'option-input', class: 'input', placeholder: 'Add an option', maxlength: 60, autocomplete: 'off', 'aria-label': 'Option' }),
         h('button', { class: 'btn', type: 'submit' }, 'Add')),
+      h('button', { class: 'btn block finder-btn', id: 'open-finder', onClick: openFinder }, '🔍 Find restaurants, activities & movies'),
       need === 0 && h('p', { class: 'muted small' }, 'Options aren’t needed when the wheel picks a person.')),
 
     h('section', { class: 'card', id: 'options-card' },
@@ -1244,6 +1251,216 @@ function optionsPhase(g, isHost) {
           g.options.length < need ? `Need at least ${need} options` : `Start: ${M.icon} ${M.label} →`),
         h('button', { class: 'btn text', onClick: () => run(backToLobby) }, '← Back to players'))
       : h('p', { class: 'center muted' }, 'The host picks how to decide and starts when everyone is done.'),
+  ];
+}
+
+/* ---------- Find nearby (restaurants, activities, movies) ---------- */
+
+function openFinder() {
+  const saved = prefs.get('lastLoc');
+  S.finder = {
+    code: S.route.code, cat: 'food', sub: 'any', radius: prefs.get('finderRadius', 1),
+    loc: saved, editingLoc: !saved, locating: false, req: 0,
+    loading: false, results: null, error: null, movies: null,
+  };
+  render();
+  if (saved) runSearch();
+  else useMyLocation();
+}
+
+function closeFinder() {
+  S.finder = null;
+  render();
+}
+
+function setFinder(changes) {
+  Object.assign(S.finder, changes);
+  if ('radius' in changes) prefs.set('finderRadius', changes.radius);
+  runSearch();
+}
+
+async function useMyLocation() {
+  const f = S.finder;
+  Object.assign(f, { locating: true, error: null });
+  render();
+  try {
+    const loc = await locateMe();
+    if (S.finder === f) setFinderLocation(loc);
+  } catch {
+    if (S.finder !== f) return;
+    Object.assign(f, { locating: false, editingLoc: true, error: "Couldn't get your location. Type a city or ZIP instead." });
+    render();
+  }
+}
+
+async function lookupPlace(text) {
+  const f = S.finder;
+  Object.assign(f, { locating: true, error: null });
+  render();
+  try {
+    const loc = await geocode(text);
+    if (S.finder !== f) return;
+    if (loc) { setFinderLocation(loc); return; }
+    f.error = `Couldn't find "${text}". Try a city name or ZIP code.`;
+  } catch {
+    if (S.finder !== f) return;
+    f.error = "Couldn't look that up. Check your connection and try again.";
+  }
+  f.locating = false;
+  render();
+}
+
+function setFinderLocation(loc) {
+  Object.assign(S.finder, { loc, locating: false, editingLoc: false });
+  prefs.set('lastLoc', loc);
+  runSearch();
+}
+
+async function runSearch() {
+  const f = S.finder;
+  if (!f) return;
+  if (f.cat === 'movies') { loadMovies(); return; }
+  if (!f.loc) { render(); return; }
+  const req = ++f.req;
+  Object.assign(f, { loading: true, error: null, results: null });
+  render();
+  try {
+    const results = await searchPlaces(f.cat, f.sub, f.loc, RADII[f.radius]);
+    if (S.finder !== f || req !== f.req) return;
+    f.results = results;
+  } catch (e) {
+    console.error(e);
+    if (S.finder !== f || req !== f.req) return;
+    f.error = 'The map service is busy or unreachable. Try again in a moment.';
+  }
+  f.loading = false;
+  render();
+}
+
+async function loadMovies() {
+  const f = S.finder;
+  if (!moviesEnabled || f.movies) { render(); return; }
+  const req = ++f.req;
+  Object.assign(f, { loading: true, error: null });
+  render();
+  try {
+    const movies = await nowPlaying();
+    if (S.finder !== f || req !== f.req) return;
+    f.movies = movies;
+  } catch (e) {
+    console.error(e);
+    if (S.finder !== f || req !== f.req) return;
+    f.error = "Couldn't load the movie list. Try again in a moment.";
+  }
+  f.loading = false;
+  render();
+}
+
+async function addFound(name) {
+  const text = name.trim().slice(0, 60);
+  const id = uid();
+  rememberMyOption(id);
+  if (await run(() => addOption(id, text))) toast(`Added "${text}"`);
+}
+
+function finderView(g) {
+  const f = S.finder;
+  const mine = new Set(g.options.filter((o) => S.myOptionIds.has(o.id)).map((o) => o.text.toLowerCase()));
+  return [
+    h('div', { class: 'row', id: 'finder-head' },
+      h('button', { class: 'btn text', id: 'close-finder', onClick: closeFinder }, '← Back to options'),
+      h('span', { class: 'grow' }),
+      h('span', { class: 'muted small' }, `${mine.size} added by you`)),
+    h('section', { class: 'card', id: 'finder' },
+      h('div', { class: 'seg finder-tabs' }, Object.entries(CATEGORIES).map(([id, c]) => h('button', {
+        class: id === f.cat ? 'on' : '', 'data-key': 'cat-' + id, 'aria-pressed': String(id === f.cat),
+        onClick: () => { if (id !== f.cat) setFinder({ cat: id, sub: 'any', results: null, error: null }); },
+      }, `${c.icon} ${c.short || c.label}`))),
+      f.cat === 'movies' ? moviesPanel(f, mine) : placesPanel(f, mine)),
+  ];
+}
+
+function locationRow(f) {
+  if (f.locating) return h('p', { class: 'muted small', id: 'loc-row' }, '📍 Finding the location…');
+  if (f.editingLoc || !f.loc) {
+    return h('form', {
+      class: 'loc-form', id: 'loc-form',
+      onSubmit: (e) => {
+        e.preventDefault();
+        const v = document.getElementById('place-input').value.trim();
+        if (v) lookupPlace(v);
+      },
+    },
+    h('div', { class: 'small muted' }, 'Search near'),
+    h('div', { class: 'row' },
+      h('input', { id: 'place-input', class: 'input', placeholder: 'City, address or ZIP', autocomplete: 'off', 'aria-label': 'City, address or ZIP' }),
+      h('button', { class: 'btn', type: 'submit' }, 'Go')),
+    h('div', { class: 'row' },
+      h('button', { class: 'btn text small', type: 'button', onClick: useMyLocation }, '📍 Use my location'),
+      f.loc && h('button', { class: 'btn text small', type: 'button', onClick: () => { f.editingLoc = false; f.error = null; render(); } }, 'Cancel')));
+  }
+  return h('div', { class: 'row', id: 'loc-row' },
+    h('span', { class: 'grow small' }, `📍 Near ${f.loc.label}`),
+    h('button', { class: 'btn text small', onClick: () => { f.editingLoc = true; render(); } }, 'Change'));
+}
+
+function finderStatus(f, emptyText) {
+  if (f.loading) return h('div', { class: 'finder-status center' }, h('div', { class: 'spinner inline' }), h('p', { class: 'muted small' }, 'Searching…'));
+  if (f.error) {
+    return h('div', { class: 'finder-status' }, h('p', { class: 'error-text' }, f.error),
+      (f.loc || f.cat === 'movies') && h('button', { class: 'btn', onClick: () => { f.movies = null; runSearch(); } }, 'Try again'));
+  }
+  return emptyText ? h('p', { class: 'muted finder-status' }, emptyText) : null;
+}
+
+function resultRow(item, mine, sub) {
+  const added = mine.has(item.name.trim().slice(0, 60).toLowerCase());
+  return h('li', { 'data-key': 'r-' + item.id },
+    item.poster !== undefined && (item.poster
+      ? h('img', { class: 'poster', src: item.poster, alt: '', loading: 'lazy' })
+      : h('div', { class: 'poster' })),
+    h('div', { class: 'grow' }, h('div', { class: 'result-name' }, item.name), sub && h('div', { class: 'muted small' }, sub)),
+    added
+      ? h('span', { class: 'tag' }, '✓ Added')
+      : h('button', { class: 'btn add-btn', 'aria-label': `Add ${item.name}`, onClick: () => addFound(item.name) }, '+ Add'));
+}
+
+function placesPanel(f, mine) {
+  const cat = CATEGORIES[f.cat];
+  const status = finderStatus(f, f.results && !f.results.length ? 'Nothing found. Try a bigger distance or another type.' : null);
+  return [
+    locationRow(f),
+    f.error && !f.loc && h('p', { class: 'error-text' }, f.error),
+    setting('Type', h('div', { class: 'chips sub-chips' }, cat.subs.map((s) => h('button', {
+      class: 'chip' + (s.id === f.sub ? ' current' : ''), 'data-key': 'sub-' + s.id,
+      onClick: () => { if (s.id !== f.sub) setFinder({ sub: s.id }); },
+    }, s.label)))),
+    setting('Within', h('div', { class: 'seg' }, RADII.map((r, i) => h('button', {
+      class: i === f.radius ? 'on' : '', 'data-key': 'rad-' + i,
+      onClick: () => { if (i !== f.radius) setFinder({ radius: i }); },
+    }, `${r} ${unitLabel}`)))),
+    f.loc && status,
+    f.results && f.results.length > 0 && !f.loading && h('ul', { class: 'list results', id: 'results' },
+      f.results.map((p) => resultRow(p, mine, [p.detail, formatDistance(p.km)].filter(Boolean).join(' · ')))),
+    h('p', { class: 'muted small attribution' }, 'Place data © OpenStreetMap contributors'),
+  ];
+}
+
+function moviesPanel(f, mine) {
+  const theaters = h('button', { class: 'btn block', id: 'find-theaters', onClick: () => setFinder({ cat: 'activities', sub: 'cinemas', results: null }) }, '🎦 Movie theaters nearby');
+  if (!moviesEnabled) {
+    return [
+      h('p', { class: 'muted' }, "🎬 The list of movies now playing needs a free key from The Movie Database (TMDB), which hasn't been set up yet."),
+      theaters,
+    ];
+  }
+  return [
+    h('p', { class: 'muted small' }, 'Now playing in theaters, best rated first.'),
+    finderStatus(f, f.movies && !f.movies.length ? 'No movies found right now.' : null),
+    f.movies && f.movies.length > 0 && !f.loading && h('ul', { class: 'list results', id: 'results' },
+      f.movies.map((m) => resultRow(m, mine, [m.rating ? `⭐ ${m.rating}` : null, m.year].filter(Boolean).join(' · ')))),
+    theaters,
+    h('p', { class: 'muted small attribution' }, 'This product uses the TMDB API but is not endorsed or certified by TMDB.'),
   ];
 }
 
