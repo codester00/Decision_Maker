@@ -298,6 +298,64 @@ button.chip:hover { border-color: var(--primary); }
 .winner { text-align: center; padding: 32px 8px; }
 .winner-name { font-size: 2.2rem; font-weight: 800; color: var(--ok); overflow-wrap: anywhere; margin: 6px 0 28px; }
 
+/* ---------- methods & ballots ---------- */
+.method-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin: 8px 0 4px; }
+.method {
+  display: flex; align-items: center; gap: 8px; min-height: 48px; padding: 8px 10px;
+  border: 1.5px solid var(--border); border-radius: 12px; background: var(--surface); color: var(--text);
+  font: inherit; font-weight: 600; font-size: .95rem; text-align: left; cursor: pointer;
+}
+.method.on { border-color: var(--primary); background: var(--primary-soft); color: var(--primary); }
+.method-icon { font-size: 1.3rem; }
+.method-current { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-size: 1.1rem; }
+.method-desc { margin: 10px 0 4px; }
+.setting { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+.seg { display: flex; flex-wrap: wrap; gap: 6px; }
+.seg button {
+  flex: 1 1 auto; min-height: 40px; padding: 6px 12px; border-radius: 10px; cursor: pointer;
+  border: 1.5px solid var(--border); background: var(--surface); color: var(--text); font: inherit; font-size: .9rem;
+}
+.seg button.on { border-color: var(--primary); background: var(--primary); color: var(--primary-ink); font-weight: 600; }
+.seg button:disabled { cursor: default; }
+.seg button:disabled:not(.on) { opacity: .5; }
+.stepper { display: flex; align-items: center; gap: 10px; }
+.btn.step { width: 44px; padding: 0; font-size: 1.3rem; }
+.step-value { min-width: 64px; text-align: center; font-weight: 700; }
+
+.choices { display: flex; flex-direction: column; gap: 8px; margin: 10px 0 14px; }
+.choice {
+  display: flex; align-items: center; gap: 12px; min-height: 52px; padding: 12px 14px;
+  border: 1.5px solid var(--border); border-radius: 12px; background: var(--surface); color: var(--text);
+  font: inherit; font-size: 1.05rem; font-weight: 600; text-align: left; cursor: pointer;
+}
+.choice.on { border-color: var(--primary); background: var(--primary-soft); }
+.choice.veto.on { border-color: var(--danger); background: color-mix(in srgb, var(--danger) 14%, var(--surface)); }
+.choice .mark { color: var(--primary); font-size: 1.2rem; }
+.choice .rank {
+  width: 30px; height: 30px; flex: none; border-radius: 50%; display: grid; place-items: center;
+  border: 1.5px dashed var(--border); font-weight: 800; color: var(--primary-ink);
+}
+.choice.on .rank { background: var(--primary); border: 0; }
+.vs { color: var(--muted); font-weight: 700; font-size: .9rem; }
+.points-left { font-weight: 700; margin: 10px 0 6px; color: var(--primary); }
+.points-left.done { color: var(--ok); }
+.points-row, .stars-row { display: flex; align-items: center; gap: 8px; min-height: 52px; border-bottom: 1px solid var(--border); }
+.points-row:last-child, .stars-row:last-child { border-bottom: 0; }
+.pts { min-width: 28px; text-align: center; font-weight: 800; font-size: 1.1rem; }
+.stars { display: flex; flex: none; }
+.star { border: 0; background: none; cursor: pointer; font-size: 1.6rem; width: 34px; height: 44px; padding: 0; color: var(--border); }
+.star.on { color: var(--accent); }
+.ballot #editor { margin-bottom: 14px; }
+.chip.done { background: var(--primary-soft); color: var(--primary); border-color: transparent; font-weight: 600; }
+.match { display: flex; align-items: center; justify-content: center; gap: 12px; flex-wrap: wrap; font-size: 1.2rem; margin-top: 6px; }
+.spin-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.spin-item { padding: 10px 14px; border-radius: 10px; background: var(--surface-2); font-weight: 600; overflow-wrap: anywhere; transition: background .1s; }
+.spin-item.on { background: var(--accent); color: #3a2a00; transform: scale(1.02); }
+.list li.out { color: var(--muted); text-decoration: line-through; }
+.score-row { margin-top: 10px; }
+.score-row .bar { margin: 4px 0 0; }
+.option-btn.tie .x { color: var(--accent); }
+
 /* ---------- dialogs & toasts ---------- */
 .overlay {
   position: fixed;

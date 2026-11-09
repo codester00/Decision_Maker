@@ -1,4 +1,9 @@
 import { createStore, isDemo } from './store.js';
+import {
+  METHODS, METHOD_ORDER, BALLOT_METHODS, RuleError, settingsOf, minOptions, pointsEach,
+  normalizeGame, startPlay, currentPlayer, eliminate, spin, applyBallot, resolveBallots, breakTie,
+  resetToOptions, resetToLobby, ballotRound,
+} from './methods.js';
 
 const $app = document.getElementById('app');
 const $modal = document.getElementById('modal-root');
@@ -94,15 +99,6 @@ function randomCode(n) {
 }
 const uid = () => randomCode(12);
 const normCode = (s) => (s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-
-function shuffle(arr) {
-  const a = [...arr];
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = crypto.getRandomValues(new Uint32Array(1))[0] % (i + 1);
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
 
 function listJoin(names) {
   if (names.length <= 1) return names.join('');
@@ -260,6 +256,10 @@ const S = {
   mode: 'normal', // normal | delete | edit
   draftNames: [],
   myOptionIds: new Set(), // only kept in memory, never sent anywhere
+  ballotFor: null, // which of this phone's players is filling in a ballot
+  draft: null, // the ballot being filled in (local until submitted)
+  reveal: null, // ranked-choice round reveal progress
+  spinWatch: null, spinAnim: null, spinDone: null, // random-pick animation
   inApp: false,
 };
 
@@ -320,11 +320,12 @@ function syncSubscriptions() {
     if (gc) {
       gameSub.off = S.store.watch('games', gc, (d) => {
         const prev = S.game;
-        S.game = d;
+        S.game = normalizeGame(d);
         if (d === null && S.family && S.family.activeGame === gc) {
           run(() => updateFamily((f) => { if (f.activeGame === gc) f.activeGame = null; }));
         }
-        if (isMyTurn(d) && !(isMyTurn(prev) && prev.turn === d.turn && prev.options.length === d.options.length)) {
+        const needKey = (x) => x && `${x.phase}:${x.method}:${x.turn}:${x.bracket ? x.bracket.history.length : ''}`;
+        if (needsMe(S.game) && !(needsMe(prev) && needKey(prev) === needKey(S.game))) {
           if (navigator.vibrate) navigator.vibrate(200);
         }
         render();
@@ -448,23 +449,39 @@ function undoDecide({ id, from }) {
 }
 
 /* =====================================================================
-   Elimination Game actions
+   Group decision ("game") actions
    A game lives in its own document. It never touches the priority list
-   or statistics, stores no record of who suggested or eliminated what,
-   and is deleted when the host ends it.
+   or statistics, stores no record of who suggested, eliminated or voted
+   for what, and is deleted when the host ends it. The rules for each
+   method live in methods.js.
    ===================================================================== */
 
 function updateGame(fn) {
   return S.store.update('games', S.route.code, (cur) => {
     if (!cur) throw new UserError('This game has ended.');
-    const g = structuredClone(cur);
-    return fn(g) === null ? null : g;
+    const g = normalizeGame(structuredClone(cur));
+    try {
+      return fn(g) === null ? null : g;
+    } catch (e) {
+      if (e instanceof RuleError) throw new UserError(e.message);
+      throw e;
+    }
   });
 }
 
+const rand = () => crypto.getRandomValues(new Uint32Array(1))[0] / 2 ** 32;
 const playerById = (g, id) => g.players.find((p) => p.id === id);
-const currentPlayer = (g) => playerById(g, g.order[g.turn]);
-const isMyTurn = (g) => !!g && g.phase === 'eliminate' && currentPlayer(g)?.device === S.clientId;
+const isMine = (g, pid) => playerById(g, pid)?.device === S.clientId;
+const myVoters = (g) => g.players.filter((p) => p.device === S.clientId && !(g.voted || []).includes(p.id));
+
+// Does this phone need to do something right now? (Used to buzz the phone.)
+function needsMe(g) {
+  if (!g) return false;
+  if (g.phase === 'play' && g.method === 'elimination') return currentPlayer(g)?.device === S.clientId;
+  if (g.phase === 'play' && BALLOT_METHODS.has(g.method)) return myVoters(g).length > 0;
+  if (g.phase === 'tiebreak') return isMine(g, g.tie.decider);
+  return false;
+}
 
 async function createGameDoc() {
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -476,12 +493,12 @@ async function createGameDoc() {
           host: S.clientId,
           family: S.familyCode || null,
           phase: 'lobby',
+          method: 'elimination',
+          settings: {},
           players: [],
           options: [],
-          order: [],
-          turn: 0,
-          winner: null,
           familyNames: S.family ? S.family.members.map((m) => m.name) : [],
+          crown: S.family && S.family.members[0] ? S.family.members[0].name : null,
           createdAt: Date.now(),
         };
       });
@@ -519,6 +536,10 @@ function takeOverHost() {
   return updateGame((g) => { g.host = S.clientId; });
 }
 
+function requireHost(g) {
+  if (g.host !== S.clientId) throw new UserError('Only the host can do that.');
+}
+
 function addPlayer(name) {
   return updateGame((g) => {
     if (g.phase !== 'lobby') throw new UserError('The game has already moved on.');
@@ -537,13 +558,14 @@ function removePlayer(id) {
 
 function toOptions() {
   return updateGame((g) => {
+    requireHost(g);
     if (g.players.length < 2) throw new UserError('Need at least 2 players.');
     g.phase = 'options';
   });
 }
 
 function backToLobby() {
-  return updateGame((g) => { g.phase = 'lobby'; });
+  return updateGame((g) => { requireHost(g); g.phase = 'lobby'; });
 }
 
 function addOption(id, text) {
@@ -563,35 +585,91 @@ function removeOption(id) {
   });
 }
 
-function startElimination() {
+function setMethod(method) {
   return updateGame((g) => {
-    if (g.options.length < 2) throw new UserError('Need at least 2 options.');
-    g.order = shuffle(g.players.map((p) => p.id)); // randomized once, then fixed
-    g.turn = 0;
-    g.phase = 'eliminate';
+    requireHost(g);
+    if (g.phase !== 'options') throw new UserError('The decision has already started.');
+    g.method = method;
   });
 }
 
-function eliminate(optionId, expectedTurn) {
+function setSetting(key, value) {
   return updateGame((g) => {
-    if (g.phase !== 'eliminate' || g.turn !== expectedTurn) throw new UserError('Someone else just played. Try again.');
+    requireHost(g);
+    if (g.phase !== 'options') throw new UserError('The decision has already started.');
+    g.settings = { ...g.settings, [key]: value };
+  });
+}
+
+function startDeciding() {
+  return updateGame((g) => {
+    requireHost(g);
+    if (g.phase !== 'options') throw new UserError('The decision has already started.');
+    startPlay(g, rand);
+  });
+}
+
+function eliminateAction(optionId, expectedTurn) {
+  return updateGame((g) => {
+    if (g.phase !== 'play' || g.method !== 'elimination' || g.turn !== expectedTurn) {
+      throw new UserError('Someone else just played. Try again.');
+    }
     const cur = currentPlayer(g);
     if (cur.device !== S.clientId && g.host !== S.clientId) throw new UserError(`It's ${cur.name}'s turn.`);
-    if (!g.options.some((o) => o.id === optionId)) throw new UserError('That option is already gone.');
-    g.options = g.options.filter((o) => o.id !== optionId);
-    if (g.options.length === 1) {
-      g.phase = 'winner';
-      g.winner = g.options[0].text;
-    } else {
-      g.turn = (g.turn + 1) % g.order.length;
-    }
+    eliminate(g, optionId, rand);
   });
 }
 
-function playAgain() {
+function spinAction() {
   return updateGame((g) => {
-    Object.assign(g, { phase: 'lobby', options: [], order: [], turn: 0, winner: null });
+    requireHost(g);
+    if (g.phase !== 'play' || g.method !== 'random') throw new UserError('Already spun.');
+    spin(g, rand);
   });
+}
+
+function submitBallot(playerId, ballot, round) {
+  return updateGame((g) => {
+    if (g.phase !== 'play' || ballotRound(g) !== round) throw new UserError('The vote moved on before yours arrived. Please vote again.');
+    const p = playerById(g, playerId);
+    if (!p || p.device !== S.clientId) throw new UserError('That player votes from another phone.');
+    if (g.voted.includes(playerId)) throw new UserError(`${p.name} has already voted.`);
+    applyBallot(g, ballot, rand);
+    g.voted.push(playerId);
+    if (g.voted.length >= g.players.length) resolveBallots(g, g.crown, rand);
+  });
+}
+
+function closeVoting(round) {
+  return updateGame((g) => {
+    requireHost(g);
+    if (g.phase !== 'play' || ballotRound(g) !== round) throw new UserError('The vote already moved on.');
+    if (!g.voted.length) throw new UserError('Nobody has voted yet.');
+    resolveBallots(g, g.crown, rand);
+  });
+}
+
+function breakTieAction(optionId) {
+  return updateGame((g) => {
+    if (g.phase !== 'tiebreak') throw new UserError('The tie was already broken.');
+    if (!isMine(g, g.tie.decider) && g.host !== S.clientId) throw new UserError('Someone else breaks this tie.');
+    breakTie(g, optionId);
+  });
+}
+
+function refreshFamilyInfo(g) {
+  if (S.family && g.family === S.familyCode) {
+    g.familyNames = S.family.members.map((m) => m.name);
+    g.crown = S.family.members[0] ? S.family.members[0].name : null;
+  }
+}
+
+function decideAgain() {
+  return updateGame((g) => { requireHost(g); resetToOptions(g); refreshFamilyInfo(g); });
+}
+
+function startOver() {
+  return updateGame((g) => { requireHost(g); resetToLobby(g); refreshFamilyInfo(g); });
 }
 
 async function endGame() {
@@ -706,6 +784,26 @@ async function onResetStats() {
   if (ok && await run(resetStats)) toast('Statistics reset.');
 }
 
+async function onCloseVoting(round) {
+  const ok = await confirmDialog({
+    title: 'Close voting now?',
+    message: "Anyone who hasn't voted yet won't be counted.",
+    ok: 'Close voting',
+  });
+  if (ok) run(() => closeVoting(round));
+}
+
+async function onBreakTie(id) {
+  const g = S.game;
+  const decider = playerById(g, g.tie.decider);
+  const ok = await confirmDialog({
+    title: `Pick "${optName(g, id)}"?`,
+    message: isMine(g, g.tie.decider) ? null : `You're breaking the tie for ${decider ? decider.name : 'the 👑'}.`,
+    ok: 'Pick it',
+  });
+  if (ok) run(() => breakTieAction(id));
+}
+
 async function onEliminate(option, turn) {
   const g = S.game;
   const cur = currentPlayer(g);
@@ -716,7 +814,7 @@ async function onEliminate(option, turn) {
     ok: 'Eliminate',
     danger: true,
   });
-  if (ok) run(() => eliminate(option.id, turn));
+  if (ok) run(() => eliminateAction(option.id, turn));
 }
 
 function familyDialog() {
@@ -842,7 +940,7 @@ function welcomeView() {
 
       h('section', { class: 'card' },
         h('h2', {}, 'Join a game'),
-        h('p', { class: 'muted small' }, "Joining someone's Elimination Game? Enter the game code."),
+        h('p', { class: 'muted small' }, "Joining someone's group decision? Enter the game code."),
         codeForm('join-game-code', 'Join game', (c) => navigate('#/game/' + c)))));
 }
 
@@ -881,7 +979,7 @@ function bottomBar() {
       tool('➕', 'Add', addMemberDialog),
       tool('🗑️', 'Delete', () => setMode('delete'), empty),
       tool('✏️', 'Edit', () => setMode('edit'), empty)),
-    h('button', { class: 'btn primary block big', onClick: openGame }, '🎲 Elimination Game'));
+    h('button', { class: 'btn primary block big', onClick: openGame }, '🎲 Decide together'));
 }
 
 function homeView() {
@@ -900,7 +998,7 @@ function homeView() {
       demoBanner(),
       f.activeGame && mode === 'normal' && h('div', { class: 'banner', id: 'game-banner' },
         h('span', {}, '🎲'),
-        h('span', { class: 'grow' }, 'An Elimination Game is in progress.'),
+        h('span', { class: 'grow' }, 'A group decision is in progress.'),
         h('button', { class: 'btn primary', onClick: () => navigate('#/game/' + f.activeGame) }, 'Join')),
       members.length === 0
         ? h('section', { class: 'card center', id: 'empty' },
@@ -952,7 +1050,7 @@ function statsView() {
       }, 'Reset statistics')));
 }
 
-/* ---------- Elimination Game views ---------- */
+/* ---------- Group decision views ---------- */
 
 function gameView() {
   const code = S.route.code;
@@ -969,10 +1067,10 @@ function gameView() {
         'Back to home', goBack);
   }
   const isHost = g.host === S.clientId;
-  const titles = { lobby: 'Players', options: 'Add options', eliminate: 'Eliminate', winner: 'Decision made!' };
-  const body = {
-    lobby: lobbyPhase, options: optionsPhase, eliminate: eliminatePhase, winner: winnerPhase,
-  }[g.phase](g, isHost);
+  const M = METHODS[g.method] || METHODS.elimination;
+  const titles = { lobby: '🎲 Players', options: '🎲 Options', play: `${M.icon} ${M.label}`, tiebreak: '👑 Tie-break', winner: '🎉 Decision made!' };
+  const phaseView = { lobby: lobbyPhase, options: optionsPhase, play: playPhase, tiebreak: tiebreakPhase, winner: winnerPhase }[g.phase];
+  const body = phaseView ? phaseView(g, isHost) : h('p', { class: 'muted' }, 'This game was made by a newer version of the app. Refresh to update.');
 
   // Warn if this phone is in an old game while the family plays a different one.
   const current = S.family && g.family === S.familyCode && S.family.activeGame && S.family.activeGame !== code
@@ -980,7 +1078,7 @@ function gameView() {
   const hasPlayerHere = g.players.some((p) => p.device === S.clientId);
 
   return h('div', { class: 'screen', 'data-key': `game-${code}-${g.phase}` },
-    appBar('🎲 ' + titles[g.phase], {
+    appBar(titles[g.phase] || '🎲', {
       back: true,
       actions: [h('span', { class: 'tag code-tag', title: 'Game code' }, code)],
     }),
@@ -1014,7 +1112,7 @@ function lobbyPhase(g, isHost) {
       h('div', { class: 'muted small' }, 'Game code'),
       h('div', { class: 'big-code' }, code),
       h('p', { class: 'muted small' }, 'Others join with this code, or from the banner on their home screen.'),
-      h('button', { class: 'btn', onClick: () => shareLink('Elimination Game', `Join our Elimination Game (code ${code})`, gameUrl(code)) }, '📤 Share game link')),
+      h('button', { class: 'btn', onClick: () => shareLink('Decide together', `Join our group decision (code ${code})`, gameUrl(code)) }, '📤 Share game link')),
 
     h('section', { class: 'card', id: 'players-card' },
       h('h2', {}, `Players (${g.players.length})`),
@@ -1057,13 +1155,16 @@ function optionsPhase(g, isHost) {
       S.myOptionIds.add(id);
     }).then((ok) => { if (!ok && !input.value) input.value = text; });
   };
+  const need = minOptions(g);
+  const M = METHODS[g.method];
 
   return [
     h('section', { class: 'card', id: 'option-entry' },
       h('p', { class: 'muted small' }, 'Everyone can add options from their own phone, as many as they like. Nobody can see who suggested what.'),
       h('form', { class: 'row', onSubmit: submitOption },
         h('input', { id: 'option-input', class: 'input', placeholder: 'Add an option', maxlength: 60, autocomplete: 'off', 'aria-label': 'Option' }),
-        h('button', { class: 'btn', type: 'submit' }, 'Add'))),
+        h('button', { class: 'btn', type: 'submit' }, 'Add')),
+      need === 0 && h('p', { class: 'muted small' }, 'Options aren’t needed when the wheel picks a person.')),
 
     h('section', { class: 'card', id: 'options-card' },
       h('h2', {}, `Options (${g.options.length})`),
@@ -1077,13 +1178,103 @@ function optionsPhase(g, isHost) {
 
     h('p', { class: 'muted small' }, 'Playing: ' + g.players.map((p) => p.name).join(', ')),
 
+    methodCard(g, isHost),
+
     isHost
       ? h('div', { class: 'stack', id: 'host-controls' },
-        h('button', { class: 'btn primary block big', id: 'start-elimination', disabled: g.options.length < 2, onClick: () => run(startElimination) },
-          g.options.length < 2 ? 'Need at least 2 options' : 'Start elimination →'),
+        h('button', { class: 'btn primary block big', id: 'start-play', disabled: g.options.length < need, onClick: () => run(startDeciding) },
+          g.options.length < need ? `Need at least ${need} options` : `Start: ${M.icon} ${M.label} →`),
         h('button', { class: 'btn text', onClick: () => run(backToLobby) }, '← Back to players'))
-      : h('p', { class: 'center muted' }, 'When everyone is done, the host starts the elimination.'),
+      : h('p', { class: 'center muted' }, 'The host picks how to decide and starts when everyone is done.'),
   ];
+}
+
+/* ---------- method picker & settings ---------- */
+
+function methodCard(g, isHost) {
+  const M = METHODS[g.method];
+  return h('section', { class: 'card', id: 'method-card' },
+    h('h2', {}, 'How will you decide?'),
+    isHost
+      ? h('div', { class: 'method-grid' }, METHOD_ORDER.map((m) => h('button', {
+        class: 'method' + (m === g.method ? ' on' : ''),
+        'data-key': 'm-' + m,
+        'aria-pressed': String(m === g.method),
+        onClick: () => { if (m !== g.method) run(() => setMethod(m)); },
+      }, h('span', { class: 'method-icon' }, METHODS[m].icon), h('span', {}, METHODS[m].label))))
+      : h('div', { class: 'method-current' }, h('span', { class: 'method-icon' }, M.icon), h('strong', {}, M.label)),
+    h('p', { class: 'muted small method-desc' }, M.desc),
+    methodSettings(g, isHost));
+}
+
+function setting(label, control) {
+  return h('div', { class: 'setting' }, h('div', { class: 'small muted' }, label), control);
+}
+
+function segmented(key, value, choices, disabled) {
+  return h('div', { class: 'seg', role: 'group' }, choices.map(([v, label]) => h('button', {
+    class: v === value ? 'on' : '',
+    'data-key': `${key}-${v}`,
+    'aria-pressed': String(v === value),
+    disabled,
+    onClick: () => { if (v !== value) run(() => setSetting(key, v)); },
+  }, label)));
+}
+
+function stepper(key, value, display, min, max, disabled) {
+  return h('div', { class: 'stepper' },
+    h('button', { class: 'btn step', 'aria-label': 'Less', disabled: disabled || value <= min, onClick: () => run(() => setSetting(key, value - 1)) }, '−'),
+    h('span', { class: 'step-value' }, display),
+    h('button', { class: 'btn step', 'aria-label': 'More', disabled: disabled || value >= max, onClick: () => run(() => setSetting(key, value + 1)) }, '+'));
+}
+
+function methodSettings(g, isHost) {
+  const s = settingsOf(g);
+  const off = !isHost;
+  if (g.method === 'vote') {
+    return setting('Style', segmented('voteStyle', s.voteStyle, [['single', 'One choice each'], ['approval', 'Approval: tick all you like']], off));
+  }
+  if (g.method === 'random') {
+    return setting('Pick', segmented('randomTarget', s.randomTarget, [['option', 'An option'], ['person', 'A person to decide']], off));
+  }
+  if (g.method === 'points') {
+    const pts = pointsEach(g);
+    return [
+      setting('Points per person', stepper('points', pts, s.points ? String(pts) : `${pts} (one per option)`, 1, 99, off)),
+      setting('Most points on one option', stepper('maxPer', s.maxPer, s.maxPer ? String(s.maxPer) : 'No limit', 0, 99, off)),
+      s.maxPer > 0 && s.maxPer * g.options.length < pts
+        && h('p', { class: 'error-text' }, 'This limit is too low to spend all the points.'),
+    ];
+  }
+  if (g.method === 'veto') {
+    return [
+      setting('Vetoes per person', stepper('vetoes', s.vetoes, String(s.vetoes), 1, 5, off)),
+      setting('Then decide the rest by', segmented('vetoThen', s.vetoThen, [['random', 'Random pick'], ['vote', 'Vote']], off)),
+    ];
+  }
+  if (g.method === 'ranked') return h('p', { class: 'muted small' }, 'Ties for last place are broken by fewest 2nd-choice votes, then at random.');
+  if (['vote', 'points', 'stars'].includes(g.method) || g.method === 'bracket') {
+    return h('p', { class: 'muted small' }, g.method === 'bracket'
+      ? 'A tied match is settled by a coin flip.'
+      : 'Ties are broken by the 👑 on your priority list if they’re playing, otherwise at random.');
+  }
+  return null;
+}
+
+/* ---------- playing ---------- */
+
+const optName = (g, id) => (g.names && g.names[id]) || '?';
+
+function vetoedNote(g) {
+  return g.vetoed && g.vetoed.length
+    ? h('p', { class: 'small muted', id: 'vetoed-note' }, '🚫 Vetoed: ' + g.vetoed.map((id) => optName(g, id)).join(', '))
+    : null;
+}
+
+function playPhase(g, isHost) {
+  if (g.method === 'elimination') return eliminatePhase(g, isHost);
+  if (g.method === 'random') return randomPhase(g, isHost);
+  return ballotPhase(g, isHost);
 }
 
 function eliminatePhase(g, isHost) {
@@ -1113,18 +1304,361 @@ function eliminatePhase(g, isHost) {
   ];
 }
 
-function winnerPhase(g, isHost) {
-  return h('div', { class: 'winner', id: 'winner' },
-    h('div', { class: 'emoji-xl' }, '🎉'),
-    h('div', { class: 'muted' }, 'The winner is'),
-    h('div', { class: 'winner-name' }, g.winner),
+function randomPhase(g, isHost) {
+  const byPerson = settingsOf(g).randomTarget === 'person';
+  const items = byPerson ? g.players.map((p) => p.name) : g.options.map((o) => o.text);
+  S.spinWatch = S.route.code; // this phone saw the wheel before it spun, so animate it
+  return [
+    vetoedNote(g),
+    h('section', { class: 'card', id: 'spin-card' },
+      h('h2', {}, byPerson ? 'Who will decide?' : 'Spin for the winner'),
+      h('div', { class: 'spin-list' }, items.map((t, i) => h('div', { class: 'spin-item', 'data-key': 'c' + i }, t)))),
     isHost
-      ? h('div', { class: 'stack' },
-        h('button', { class: 'btn primary big', onClick: () => run(playAgain) }, 'Play again'),
-        h('button', { class: 'btn', onClick: () => run(endGame) }, 'End game and go home'))
+      ? h('button', { class: 'btn primary block big', id: 'spin-btn', onClick: () => run(spinAction) }, '🎡 Spin!')
+      : h('p', { class: 'center muted' }, 'Waiting for the host to spin…'),
+  ];
+}
+
+function ballotPhase(g, isHost) {
+  const round = ballotRound(g);
+  const voters = myVoters(g);
+  if (!voters.some((p) => p.id === S.ballotFor)) S.ballotFor = voters[0] ? voters[0].id : null;
+  const total = g.players.length;
+  const done = g.voted.length;
+
+  return [
+    vetoedNote(g),
+    g.method === 'bracket' && matchCard(g),
+    h('section', { class: 'card', id: 'vote-status' },
+      h('div', { class: 'row' },
+        h('strong', { class: 'grow' }, `${done} of ${total} voted`),
+        isHost && done > 0 && done < total && h('button', { class: 'btn text small', id: 'close-voting', onClick: () => onCloseVoting(round) }, 'Close voting')),
+      h('div', { class: 'chips' }, g.players.map((p) => {
+        const has = g.voted.includes(p.id);
+        return h('span', { class: 'chip' + (has ? ' done' : ''), 'data-key': 'v-' + p.id }, (has ? '✓ ' : '… ') + p.name);
+      }))),
+    S.ballotFor
+      ? ballotCard(g, playerById(g, S.ballotFor), voters, round)
+      : h('p', { class: 'center muted', id: 'waiting' }, g.players.some((p) => p.device === S.clientId)
+        ? 'Thanks! Waiting for everyone else to vote…'
+        : 'Waiting for everyone to vote…'),
+    g.method === 'bracket' && bracketHistory(g),
+  ];
+}
+
+function draftFor(g, pid) {
+  const key = `${S.route.code}:${ballotRound(g)}:${pid}`;
+  if (!S.draft || S.draft.key !== key) S.draft = { key, data: emptyDraft(g) };
+  return S.draft;
+}
+
+function emptyDraft(g) {
+  const s = settingsOf(g);
+  if (g.method === 'vote') return s.voteStyle === 'approval' ? [] : null;
+  if (g.method === 'points' || g.method === 'stars') return {};
+  if (g.method === 'ranked' || g.method === 'veto') return [];
+  return null; // bracket
+}
+
+function ballotHint(g) {
+  const s = settingsOf(g);
+  switch (g.method) {
+    case 'vote': return s.voteStyle === 'approval' ? 'Tick every option you’d be happy with.' : 'Tap your choice.';
+    case 'points': return `Spread ${g.pointsEach} points however you like${s.maxPer ? ` (at most ${s.maxPer} on one option)` : ''}.`;
+    case 'ranked': return 'Tap options in order of preference, favorite first. Rank as many as you like. Tap again to un-rank.';
+    case 'veto': return `Pick ${g.vetoesEach === 1 ? 'the one option' : `${g.vetoesEach} options`} you’d most like to rule out.`;
+    case 'stars': return 'Rate each option. Tap the same star again to clear it.';
+    case 'bracket': return 'Which one do you prefer?';
+    default: return '';
+  }
+}
+
+function ballotProblem(g, data) {
+  const s = settingsOf(g);
+  switch (g.method) {
+    case 'vote':
+      if (s.voteStyle === 'approval') return data.length ? null : 'Tick at least one';
+      return data ? null : 'Pick one';
+    case 'bracket': return data ? null : 'Pick one';
+    case 'points': {
+      const left = g.pointsEach - Object.values(data).reduce((t, n) => t + n, 0);
+      return left === 0 ? null : `${left} ${left === 1 ? 'point' : 'points'} left to spend`;
+    }
+    case 'ranked': return data.length ? null : 'Rank at least one';
+    case 'veto': {
+      const more = g.vetoesEach - data.length;
+      return more === 0 ? null : `Pick ${more} more to veto`;
+    }
+    default: return null;
+  }
+}
+
+function ballotCard(g, player, voters, round) {
+  const d = draftFor(g, player.id);
+  const problem = ballotProblem(g, d.data);
+  const submit = () => run(() => submitBallot(player.id, d.data, round));
+  return h('section', { class: 'card ballot', id: 'ballot' },
+    voters.length > 1 && [
+      h('p', { class: 'small muted' }, 'Several people vote on this phone. Pass it around so each person votes in secret.'),
+      h('div', { class: 'chips' }, voters.map((p) => h('button', {
+        class: 'chip' + (p.id === player.id ? ' current' : ''), 'data-key': 'bf-' + p.id,
+        onClick: () => { S.ballotFor = p.id; render(); },
+      }, p.name)))],
+    h('h2', {}, `${player.name}'s ballot`),
+    h('p', { class: 'muted small' }, ballotHint(g)),
+    ballotEditor(g, d),
+    h('button', { class: 'btn primary block big', id: 'submit-ballot', disabled: !!problem, onClick: submit }, problem || `Submit ${player.name}'s vote`),
+    h('p', { class: 'muted small center' }, '🔒 Secret. A vote can’t be changed after it’s submitted.'));
+}
+
+function ballotEditor(g, d) {
+  const s = settingsOf(g);
+  const set = (v) => { d.data = v; render(); };
+  const opts = g.method === 'bracket'
+    ? g.bracket.queue.slice(0, 2).map((id) => ({ id, text: optName(g, id) }))
+    : g.options;
+
+  if (g.method === 'bracket' || (g.method === 'vote' && s.voteStyle !== 'approval')) {
+    const buttons = opts.map((o) => h('button', {
+      class: 'choice' + (d.data === o.id ? ' on' : ''), 'data-key': 'c-' + o.id, 'aria-pressed': String(d.data === o.id),
+      onClick: () => set(o.id),
+    }, h('span', { class: 'grow' }, o.text), h('span', { class: 'mark' }, d.data === o.id ? '●' : '○')));
+    if (g.method === 'bracket') buttons.splice(1, 0, h('div', { class: 'vs center' }, 'vs'));
+    return h('div', { class: 'choices', id: 'editor' }, buttons);
+  }
+
+  if (g.method === 'vote' || g.method === 'veto') {
+    const veto = g.method === 'veto';
+    return h('div', { class: 'choices', id: 'editor' }, opts.map((o) => {
+      const on = d.data.includes(o.id);
+      return h('button', {
+        class: 'choice' + (on ? ' on' : '') + (veto ? ' veto' : ''), 'data-key': 'c-' + o.id, 'aria-pressed': String(on),
+        onClick: () => {
+          if (on) set(d.data.filter((id) => id !== o.id));
+          else if (veto && d.data.length >= g.vetoesEach) toast(`You can only veto ${g.vetoesEach}. Tap one to undo it first.`);
+          else set([...d.data, o.id]);
+        },
+      }, h('span', { class: 'grow' }, o.text), h('span', { class: 'mark' }, on ? (veto ? '🚫' : '☑') : '☐'));
+    }));
+  }
+
+  if (g.method === 'points') {
+    const used = Object.values(d.data).reduce((t, n) => t + n, 0);
+    const left = g.pointsEach - used;
+    const change = (id, delta) => set({ ...d.data, [id]: (d.data[id] || 0) + delta });
+    return h('div', { id: 'editor' },
+      h('div', { class: 'points-left' + (left === 0 ? ' done' : '') }, `${left} of ${g.pointsEach} points left`),
+      opts.map((o) => {
+        const n = d.data[o.id] || 0;
+        return h('div', { class: 'points-row', 'data-key': 'p-' + o.id },
+          h('span', { class: 'grow' }, o.text),
+          h('button', { class: 'btn step', 'aria-label': `Less for ${o.text}`, disabled: n <= 0, onClick: () => change(o.id, -1) }, '−'),
+          h('span', { class: 'pts' }, n),
+          h('button', {
+            class: 'btn step', 'aria-label': `More for ${o.text}`,
+            disabled: left <= 0 || (s.maxPer > 0 && n >= s.maxPer), onClick: () => change(o.id, 1),
+          }, '+'));
+      }));
+  }
+
+  if (g.method === 'stars') {
+    return h('div', { id: 'editor' }, opts.map((o) => {
+      const r = d.data[o.id] || 0;
+      return h('div', { class: 'stars-row', 'data-key': 's-' + o.id },
+        h('span', { class: 'grow' }, o.text),
+        h('span', { class: 'stars' }, [1, 2, 3, 4, 5].map((k) => h('button', {
+          class: 'star' + (k <= r ? ' on' : ''), 'aria-label': `${k} stars for ${o.text}`,
+          onClick: () => set({ ...d.data, [o.id]: r === k ? 0 : k }),
+        }, '★'))));
+    }));
+  }
+
+  if (g.method === 'ranked') {
+    return h('div', { id: 'editor' },
+      h('div', { class: 'choices' }, opts.map((o) => {
+        const rank = d.data.indexOf(o.id) + 1;
+        return h('button', {
+          class: 'choice' + (rank ? ' on' : ''), 'data-key': 'c-' + o.id,
+          onClick: () => set(rank ? d.data.filter((id) => id !== o.id) : [...d.data, o.id]),
+        }, h('span', { class: 'rank' }, rank || ''), h('span', { class: 'grow' }, o.text));
+      })),
+      d.data.length > 0 && h('button', { class: 'btn text small', onClick: () => set([]) }, 'Clear ranking'));
+  }
+  return null;
+}
+
+function matchCard(g) {
+  const b = g.bracket;
+  const [x, y] = b.queue;
+  const matchNo = b.history.filter((m) => m.round === b.round && !m.bye).length + 1;
+  return h('section', { class: 'card center', id: 'match-card' },
+    h('div', { class: 'muted small' }, `Round ${b.round} · Match ${matchNo}`),
+    h('div', { class: 'match' }, h('strong', {}, optName(g, x)), h('span', { class: 'vs' }, 'vs'), h('strong', {}, optName(g, y))));
+}
+
+function matchLine(g, m) {
+  if (m.bye) return `${optName(g, m.x)} gets a bye`;
+  const loser = m.winner === m.x ? m.y : m.x;
+  const [vw, vl] = m.winner === m.x ? [m.vx, m.vy] : [m.vy, m.vx];
+  return `${optName(g, m.winner)} beat ${optName(g, loser)} ${vw}–${vl}${m.coin ? ' (coin flip)' : ''}`;
+}
+
+function bracketHistory(g) {
+  const hist = (g.bracket && g.bracket.history) || (g.result && g.result.history) || [];
+  if (!hist.length) return null;
+  return h('section', { class: 'card', id: 'bracket-history' },
+    h('h2', {}, 'Bracket results'),
+    h('ul', { class: 'list' }, hist.map((m, i) => h('li', { 'data-key': 'bh-' + i },
+      h('span', { class: 'tag muted-tag' }, `R${m.round}`), h('span', { class: 'grow' }, matchLine(g, m))))));
+}
+
+/* ---------- ties ---------- */
+
+function tiebreakPhase(g, isHost) {
+  const decider = playerById(g, g.tie.decider);
+  const mine = isMine(g, g.tie.decider);
+  const can = mine || isHost;
+  return [
+    h('div', { class: 'turn-banner' + (mine ? ' mine' : ''), id: 'tie-banner' },
+      h('strong', {}, "It's a tie!"),
+      h('div', { class: 'small' }, mine
+        ? `${decider.name}, you're the 👑 on the priority list, so you break the tie.`
+        : `${decider ? decider.name : 'The 👑'} breaks the tie as the 👑 on the priority list…${isHost ? ' (As the host you can tap for them.)' : ''}`)),
+    h('div', { id: 'tie-options' }, g.tie.ids.map((id) => h('button', {
+      class: 'option-btn tie', 'data-key': 't-' + id, disabled: !can, onClick: () => onBreakTie(id),
+    }, h('span', { class: 'grow' }, optName(g, id)), h('span', { class: 'x' }, '👑')))),
+    scoresCard(g),
+  ];
+}
+
+/* ---------- results ---------- */
+
+function scoresCard(g) {
+  const r = g.result;
+  if (!r || r.kind !== 'scores') return null;
+  const stars = g.method === 'stars';
+  const value = (id) => (stars ? (r.ballots ? r.tally[id] / r.ballots : 0) : r.tally[id]);
+  const idsSorted = Object.keys(r.tally).sort((a, b) => value(b) - value(a));
+  const max = Math.max(1e-9, ...idsSorted.map(value));
+  const label = (id) => {
+    const v = value(id);
+    if (stars) return `★ ${v.toFixed(1)}`;
+    if (g.method === 'points') return `${v} ${v === 1 ? 'point' : 'points'}`;
+    return `${v} ${v === 1 ? 'vote' : 'votes'}`;
+  };
+  return h('section', { class: 'card', id: 'scores' },
+    h('h2', {}, 'Results'),
+    idsSorted.map((id) => h('div', { class: 'score-row', 'data-key': 'sc-' + id },
+      h('div', { class: 'row' }, h('span', { class: 'grow' }, optName(g, id)), h('strong', {}, label(id))),
+      h('div', { class: 'bar' }, h('div', { class: 'bar-fill', style: `width:${(value(id) / max) * 100}%` })))),
+    h('p', { class: 'muted small' }, `${r.ballots} ${r.ballots === 1 ? 'ballot' : 'ballots'} counted.`));
+}
+
+function roundCard(g, round, i) {
+  const idsSorted = Object.keys(round.counts).sort((a, b) => round.counts[b] - round.counts[a]);
+  const tieText = round.tie === 'second' ? ' (tied for last; fewest 2nd-choice votes)'
+    : round.tie === 'random' ? ' (tied for last; picked at random)' : '';
+  return h('section', { class: 'card', 'data-key': 'round-' + i },
+    h('h2', {}, `Round ${i + 1}`),
+    h('ul', { class: 'list' }, idsSorted.map((id) => h('li', { class: id === round.eliminated ? 'out' : '', 'data-key': 'rc-' + id },
+      h('span', { class: 'grow' }, optName(g, id)), h('strong', {}, round.counts[id])))),
+    h('p', { class: 'small' }, `❌ ${optName(g, round.eliminated)} is knocked out${tieText}.`),
+    round.exhausted > 0 && h('p', { class: 'muted small' }, `${round.exhausted} ${round.exhausted === 1 ? 'ballot has' : 'ballots have'} no choices left.`));
+}
+
+function revealKey(g) {
+  return `${S.route.code}:${g.result.rounds.map((r) => r.eliminated).join(',')}`;
+}
+
+function rankedRevealDone(g) {
+  const key = revealKey(g);
+  if (!S.reveal || S.reveal.key !== key) S.reveal = { key, n: 1, done: false };
+  return S.reveal.done;
+}
+
+function rankedReveal(g) {
+  const rounds = g.result.rounds;
+  const n = S.reveal.n;
+  return [
+    h('p', { class: 'muted center' }, 'Counting the ranked ballots, one round at a time…'),
+    rounds.slice(0, n).map((r, i) => roundCard(g, r, i)),
+    h('div', { class: 'stack' },
+      h('button', {
+        class: 'btn primary block big', id: 'next-round',
+        onClick: () => { if (n < rounds.length) S.reveal.n++; else S.reveal.done = true; render(); },
+      }, n < rounds.length ? 'Next round ▶' : 'Show the winner 🎉'),
+      h('button', { class: 'btn text', onClick: () => { S.reveal.done = true; render(); } }, 'Skip to the result')),
+  ];
+}
+
+function spinKey(g) { return `${S.route.code}:${g.spin.at}:${g.spin.pick}`; }
+
+function spinFinished(g) {
+  const key = spinKey(g);
+  if (S.spinDone === key) return true;
+  if (S.spinAnim && S.spinAnim.key === key) return false;
+  if (S.spinWatch === S.route.code) {
+    S.spinWatch = null;
+    startSpin(key, g.spin.candidates.length, g.spin.pick);
+    return false;
+  }
+  S.spinDone = key; // joined after the spin; just show the result
+  return true;
+}
+
+function startSpin(key, n, pick) {
+  const steps = n * Math.max(2, Math.ceil(18 / n)) + pick;
+  S.spinAnim = { key, i: 0 };
+  let k = 0;
+  const tick = () => {
+    if (!S.spinAnim || S.spinAnim.key !== key) return;
+    k++;
+    S.spinAnim.i = k % n;
+    render();
+    if (k >= steps) {
+      setTimeout(() => { S.spinDone = key; S.spinAnim = null; render(); }, 700);
+      return;
+    }
+    const t = k / steps;
+    setTimeout(tick, 45 + 380 * t * t * t);
+  };
+  setTimeout(tick, 45);
+}
+
+function spinningView(g) {
+  return h('section', { class: 'card', id: 'spinning' },
+    h('h2', { class: 'center' }, '🎡 Spinning…'),
+    h('div', { class: 'spin-list' }, g.spin.candidates.map((t, i) => h('div', {
+      class: 'spin-item' + (S.spinAnim && S.spinAnim.i === i ? ' on' : ''), 'data-key': 'c' + i,
+    }, t))));
+}
+
+function winnerPhase(g, isHost) {
+  const r = g.result || {};
+  if (g.spin && !spinFinished(g)) return spinningView(g);
+  if (r.kind === 'ranked' && !rankedRevealDone(g)) return rankedReveal(g);
+  const M = METHODS[g.method];
+
+  return [
+    h('div', { class: 'winner', id: 'winner' },
+      h('div', { class: 'emoji-xl' }, '🎉'),
+      h('div', { class: 'muted' }, r.byPerson ? 'The wheel says' : 'The winner is'),
+      h('div', { class: 'winner-name' }, g.winner),
+      r.note && h('p', { class: 'muted small' }, r.note),
+      h('div', { class: 'muted small' }, `Decided by ${M.icon} ${M.label}`)),
+    vetoedNote(g),
+    scoresCard(g),
+    r.kind === 'ranked' && r.rounds.map((round, i) => roundCard(g, round, i)),
+    r.kind === 'bracket' && bracketHistory(g),
+    isHost
+      ? h('div', { class: 'stack', id: 'winner-controls' },
+        h('button', { class: 'btn primary big', id: 'decide-again', onClick: () => run(decideAgain) }, 'Decide again with the same options'),
+        h('button', { class: 'btn', id: 'start-over', onClick: () => run(startOver) }, 'Start over with new options'),
+        h('button', { class: 'btn text', id: 'end-game', onClick: () => run(endGame) }, 'End game and go home'))
       : h('div', { class: 'stack' },
-        h('p', { class: 'muted small' }, 'The host can start another round.'),
-        h('button', { class: 'btn', onClick: goBack }, 'Back to home')));
+        h('p', { class: 'muted small center' }, 'The host can start another round.'),
+        h('button', { class: 'btn', onClick: goBack }, 'Back to home')),
+  ];
 }
 
 /* ---------- top-level render ---------- */

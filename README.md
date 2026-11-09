@@ -15,14 +15,31 @@ A small web app with the decision-making methods our family finds most useful. I
 ### Statistics (📊)
 - For each person: total decisions, plus what position they were in when they decided (`#1: 12, #2: 2`). Counts are all-time until someone taps **Reset statistics** (asks for confirmation; the list order is kept). Deleting a person deletes their statistics.
 
-### Elimination Game (🎲)
-Completely separate from the priority list: it never changes the order or the statistics. **Only one game per family runs at a time:** starting a game while one is running asks whether to join it or end it for everyone and start fresh.
-1. **Players.** Anyone in the family taps the game banner (or enters the game code / opens the shared link) and adds themselves by name. One phone can add several people (for example, kids without phones). Each person can only play from one phone. Minimum 2 players.
-2. **Options.** Everyone adds options from their own phone at the same time, as many as they like. You can remove options you added yourself. Nobody can see who suggested what.
-3. **Eliminate.** The turn order is shuffled once and then stays fixed. The current player is highlighted on every phone and their phone buzzes. On your turn you tap an option to eliminate it. The host can play a turn for someone who is stuck.
-4. **Winner.** If the host's phone gets stuck, any player's phone can **take over as host**. When one option is left, the host can **Play again** (same players) or **End game**, which deletes the game completely.
+### Decide together (🎲)
+Group decisions on everyone's phones. They are completely separate from the priority list: they never change the order or the statistics. **Only one per family runs at a time:** starting one while another is running asks whether to join it or end it for everyone and start fresh.
 
-**Privacy:** the game stores no record of who suggested or eliminated anything, and nothing from it is kept after the host ends it.
+1. **Players.** Family members tap the banner on their home screen (or enter the game code / open the shared link) and add themselves. One phone can add several people (for example, kids without phones), but each person plays from only one phone. Minimum 2 players.
+2. **Options.** Everyone adds options from their own phone at the same time. You can remove options you added yourself. Nobody can see who suggested what.
+3. **Method.** The host picks how to decide (everyone sees the choice live) and starts:
+
+| Method | How it works | Host settings |
+| --- | --- | --- |
+| 🎯 Elimination | Players take turns (in a shuffled, fixed order) knocking out one option until one is left. | |
+| 🎡 Random pick | The host spins; every phone watches the same spin. | Pick an option, or a person to decide |
+| 🗳️ Vote | Secret vote; most votes wins. | One choice each, or approval (tick all you like) |
+| 💰 Points | Spread your points however you like, all on one option or split. | Points per person (default: one per option); most points on one option |
+| 🥇 Ranked choice | Rank favorites. Each round the option with the fewest first choices is knocked out and those ballots move to their next choice, until one is left. Revealed round by round. | |
+| 🚫 Veto round | Everyone secretly vetoes options; the survivors go to a random pick or a vote. If everything is vetoed, the least-vetoed options survive. | Vetoes per person; then random or vote |
+| 🏆 Bracket | Options face off two at a time, tournament style; everyone votes each match. | |
+| ⭐ Star rating | Rate every option 0–5 stars; highest total wins. | |
+
+4. **Results.** The winner and the breakdown are shown on every phone. The host can **decide again with the same options** (maybe with another method), **start over**, or **end the game**, which deletes it completely.
+
+**Ties:** for votes, points and stars, the family's 👑 (#1 on the priority list when the game started) breaks the tie if they're playing; otherwise it's random. Ranked choice breaks ties for last place by fewest 2nd-choice votes, then randomly. A tied bracket match is a coin flip.
+
+**If something gets stuck:** the host can close voting early (missing votes aren't counted) and can play an Elimination turn or break a tie for someone. If the host's phone is stuck, any player's phone can **take over as host**.
+
+**Privacy:** votes are secret. The app keeps only running totals (and, for ranked choice, unnamed ballots in random order), never who suggested, eliminated or voted for what. Nothing is kept after the host ends the game.
 
 ## Codes and joining
 - Each family has a 6-character **family code** (👪 button). On another phone, open the app and enter the code, or send the **invite link**.
@@ -66,14 +83,14 @@ On the live site you can also add `?demo` to the address (https://codester00.git
 | --- | --- |
 | `index.html` | Page shell |
 | `css/styles.css` | Styles (mobile-first, light and dark mode) |
-| `js/app.js` | Screens, actions and game logic |
+| `js/app.js` | Screens and actions |
+| `js/methods.js` | Rules for each decision method (pure logic) |
 | `js/store.js` | Data layer: Firestore, or localStorage in demo mode |
 | `js/firebase-config.js` | Your Firebase web config |
 | `firestore.rules` | Firestore security rules |
 
-Data model: `families/{code}` holds `{ members: [{id, name, decisions, positions}], activeGame }`, with members in priority order. `games/{code}` holds `{ host, phase, players: [{id, name, device}], options: [{id, text}], order, turn, winner }`. Every change runs as a transaction, so taps on two phones at the same moment can't corrupt the list.
+Data model: `families/{code}` holds `{ members: [{id, name, decisions, positions}], activeGame }`, with members in priority order. `games/{code}` holds the players, options, chosen method and settings, and the state of the current round (see `CLAUDE.md`). Every change runs as a transaction, so taps on two phones at the same moment can't corrupt the list.
 
 ## Ideas for later
 - Native Android/iOS apps (for example by wrapping this web app), if the home-screen web app isn't enough.
-- More decision methods.
 - Clean up abandoned games automatically (a Firestore TTL policy on `createdAt`).

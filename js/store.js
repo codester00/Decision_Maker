@@ -74,7 +74,7 @@ class FirebaseStore {
     ]);
     const app = appMod.initializeApp(config);
     this.fs = fs;
-    this.db = fs.getFirestore(app);
+    this.db = fs.initializeFirestore(app, { ignoreUndefinedProperties: true });
     await authMod.signInAnonymously(authMod.getAuth(app));
     this.mode = 'firebase';
     return this;
