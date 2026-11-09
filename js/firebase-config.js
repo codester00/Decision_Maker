@@ -4,12 +4,19 @@
 // These values are NOT secret (every web app that uses Firebase ships them to the browser).
 // Who can read/write data is controlled by firestore.rules.
 //
-// While this is null the app runs in DEMO MODE: everything stays in this browser only,
+// If this is set to null the app runs in DEMO MODE: everything stays in this browser only,
 // and each browser tab pretends to be a separate phone.
 
-export const firebaseConfig = null;
+export const firebaseConfig = {
+  apiKey: "AIzaSyCzhMTNpKt3rI-TrV-KawtIblSzKt3kdAc",
+  authDomain: "decision-maker-6207f.firebaseapp.com",
+  projectId: "decision-maker-6207f",
+  storageBucket: "decision-maker-6207f.firebasestorage.app",
+  messagingSenderId: "700833031478",
+  appId: "1:700833031478:web:0b3e8285044a6ac3f93f97"
+};
 
-/* Example — replace `null` above with an object like this:
+/* Example shape:
 
 export const firebaseConfig = {
   apiKey: "AIza...",
