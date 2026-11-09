@@ -12,6 +12,10 @@
 
 import { firebaseConfig } from './firebase-config.js';
 
+// Add ?demo to the address to force demo mode (handy for trying things out
+// without touching the real family data).
+export const isDemo = !(firebaseConfig && firebaseConfig.apiKey) || new URLSearchParams(location.search).has('demo');
+
 const FIREBASE_SDK = 'https://www.gstatic.com/firebasejs/10.14.1/';
 
 class LocalStore {
@@ -104,8 +108,6 @@ class FirebaseStore {
 }
 
 export async function createStore() {
-  if (firebaseConfig && firebaseConfig.apiKey) {
-    return new FirebaseStore().init(firebaseConfig);
-  }
+  if (!isDemo) return new FirebaseStore().init(firebaseConfig);
   return new LocalStore();
 }

@@ -13,14 +13,14 @@ A small web app with the decision-making methods our family finds most useful. I
 - Names must be unique (not case-sensitive).
 
 ### Statistics (📊)
-- For each person: total decisions, plus what position they were in when they decided (`#1: 12, #2: 2`). Counts are all-time. Deleting a person deletes their statistics.
+- For each person: total decisions, plus what position they were in when they decided (`#1: 12, #2: 2`). Counts are all-time until someone taps **Reset statistics** (asks for confirmation; the list order is kept). Deleting a person deletes their statistics.
 
 ### Elimination Game (🎲)
-Completely separate from the priority list: it never changes the order or the statistics.
-1. **Players.** Anyone in the family taps the game banner (or enters the game code / opens the shared link) and adds themselves by name. One phone can add several people (for example, kids without phones). Minimum 2 players.
+Completely separate from the priority list: it never changes the order or the statistics. **Only one game per family runs at a time:** starting a game while one is running asks whether to join it or end it for everyone and start fresh.
+1. **Players.** Anyone in the family taps the game banner (or enters the game code / opens the shared link) and adds themselves by name. One phone can add several people (for example, kids without phones). Each person can only play from one phone. Minimum 2 players.
 2. **Options.** Everyone adds options from their own phone at the same time, as many as they like. You can remove options you added yourself. Nobody can see who suggested what.
 3. **Eliminate.** The turn order is shuffled once and then stays fixed. The current player is highlighted on every phone and their phone buzzes. On your turn you tap an option to eliminate it. The host can play a turn for someone who is stuck.
-4. **Winner.** When one option is left, the host can **Play again** (same players) or **End game**, which deletes the game completely.
+4. **Winner.** If the host's phone gets stuck, any player's phone can **take over as host**. When one option is left, the host can **Play again** (same players) or **End game**, which deletes the game completely.
 
 **Privacy:** the game stores no record of who suggested or eliminated anything, and nothing from it is kept after the host ends it.
 
@@ -43,6 +43,8 @@ python -m http.server 8000        (or: npx serve)
 ```
 
 Then open http://localhost:8000. Open a second tab to play the other phone.
+
+On the live site you can also add `?demo` to the address (https://codester00.github.io/Decision_Maker/?demo) to try things out with separate, browser-only data that never touches the real family.
 
 ### 2. Create the Firebase backend (free, about 10 minutes)
 1. Go to https://console.firebase.google.com and click **Create a project** (Google Analytics is not needed).

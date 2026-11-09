@@ -1,4 +1,4 @@
-import { createStore } from './store.js';
+import { createStore, isDemo } from './store.js';
 
 const $app = document.getElementById('app');
 const $modal = document.getElementById('modal-root');
@@ -83,6 +83,9 @@ function patchChildren(parent, newKids) {
 
 class UserError extends Error {}
 class CodeTaken extends Error {}
+class GameInProgress extends Error {
+  constructor(code) { super('A game is already in progress.'); this.code = code; }
+}
 
 const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O or 1/I confusion
 function randomCode(n) {
@@ -113,14 +116,16 @@ function nameError(name, existing) {
   return null;
 }
 
+// Demo mode keeps its own settings so it never mixes with the real family.
+const PREF = isDemo ? 'fdm:pref:demo:' : 'fdm:pref:';
 const prefs = {
   get(k, d = null) {
-    try { const v = localStorage.getItem('fdm:pref:' + k); return v == null ? d : JSON.parse(v); } catch { return d; }
+    try { const v = localStorage.getItem(PREF + k); return v == null ? d : JSON.parse(v); } catch { return d; }
   },
   set(k, v) {
     try {
-      if (v == null) localStorage.removeItem('fdm:pref:' + k);
-      else localStorage.setItem('fdm:pref:' + k, JSON.stringify(v));
+      if (v == null) localStorage.removeItem(PREF + k);
+      else localStorage.setItem(PREF + k, JSON.stringify(v));
     } catch { /* storage unavailable */ }
   },
 };
@@ -421,6 +426,12 @@ async function decide(id) {
   toast(`${info.name} made the decision.`, { action: 'Undo', onAction: () => run(() => undoDecide(info)) });
 }
 
+function resetStats() {
+  return updateFamily((f) => {
+    for (const m of f.members) { m.decisions = 0; m.positions = {}; }
+  });
+}
+
 function undoDecide({ id, from }) {
   return updateFamily((f) => {
     const i = f.members.findIndex((m) => m.id === id);
@@ -455,7 +466,7 @@ const playerById = (g, id) => g.players.find((p) => p.id === id);
 const currentPlayer = (g) => playerById(g, g.order[g.turn]);
 const isMyTurn = (g) => !!g && g.phase === 'eliminate' && currentPlayer(g)?.device === S.clientId;
 
-async function createGame() {
+async function createGameDoc() {
   for (let attempt = 0; attempt < 5; attempt++) {
     const code = randomCode(6);
     try {
@@ -463,6 +474,7 @@ async function createGame() {
         if (cur) throw new CodeTaken();
         return {
           host: S.clientId,
+          family: S.familyCode || null,
           phase: 'lobby',
           players: [],
           options: [],
@@ -473,14 +485,38 @@ async function createGame() {
           createdAt: Date.now(),
         };
       });
-      if (S.family) await updateFamily((f) => { f.activeGame = code; });
-      navigate('#/game/' + code);
-      return;
+      return code;
     } catch (e) {
       if (!(e instanceof CodeTaken)) throw e;
     }
   }
   throw new UserError('Could not create a game code. Please try again.');
+}
+
+// Only one game per family can run at a time. `expected` is the family's
+// active game as this phone last saw it (null if none, or the code of a game
+// the user chose to replace). The claim on the family document is atomic, so
+// if two phones start a game at the same moment only one wins; the other is
+// told a game is already in progress.
+async function createGame(expected) {
+  const code = await createGameDoc();
+  try {
+    await updateFamily((f) => {
+      const cur = f.activeGame || null;
+      if (cur !== expected) throw new GameInProgress(cur);
+      f.activeGame = code;
+    });
+  } catch (e) {
+    await S.store.update('games', code, () => null).catch(() => {});
+    throw e;
+  }
+  // End the replaced game so nobody is left playing in it.
+  if (expected) await S.store.update('games', expected, () => null).catch(() => {});
+  navigate('#/game/' + code);
+}
+
+function takeOverHost() {
+  return updateGame((g) => { g.host = S.clientId; });
 }
 
 function addPlayer(name) {
@@ -619,18 +655,55 @@ function setMode(mode) {
   render();
 }
 
-async function openGame() {
-  const active = S.family.activeGame;
-  if (active) {
-    const choice = await choiceDialog({
-      title: 'A game is already running',
-      message: 'Join it, or start a new one?',
-      choices: [{ label: 'Start new', value: 'new' }, { label: 'Join', value: 'join', primary: true }],
-    });
-    if (choice === 'join') { navigate('#/game/' + active); return; }
-    if (choice !== 'new') return;
+async function openGame(known = S.family.activeGame || null) {
+  let expected = known;
+  if (expected) {
+    let existing = null;
+    try { existing = await S.store.get('games', expected); } catch { existing = null; }
+    if (existing) {
+      const choice = await choiceDialog({
+        title: 'A game is already in progress',
+        message: 'Only one game can run at a time. Join it, or end it for everyone and start a new one?',
+        choices: [
+          { label: 'End it & start new', value: 'new' },
+          { label: 'Join', value: 'join', primary: true },
+        ],
+      });
+      if (choice === 'join') { navigate('#/game/' + expected); return; }
+      if (choice !== 'new') return;
+    }
+    // If the game no longer exists, `expected` is a stale pointer that we replace.
   }
-  run(createGame);
+  try {
+    await createGame(expected);
+  } catch (e) {
+    if (e instanceof GameInProgress) {
+      // Someone else started a game a moment ago; ask again with the fresh info.
+      openGame(e.code);
+      return;
+    }
+    if (!(e instanceof UserError)) console.error(e);
+    toast(e instanceof UserError ? e.message : 'Something went wrong. Check your internet connection and try again.');
+  }
+}
+
+async function onTakeOver() {
+  const ok = await confirmDialog({
+    title: 'Take over as host?',
+    message: "Use this if the host's phone is stuck or gone. Your phone will control the game from now on.",
+    ok: 'Take over',
+  });
+  if (ok) run(takeOverHost);
+}
+
+async function onResetStats() {
+  const ok = await confirmDialog({
+    title: 'Reset all statistics?',
+    message: "Every person's decision count goes back to zero on all phones. The order of the list stays the same. This can't be undone.",
+    ok: 'Reset',
+    danger: true,
+  });
+  if (ok && await run(resetStats)) toast('Statistics reset.');
 }
 
 async function onEliminate(option, turn) {
@@ -693,7 +766,7 @@ function demoBanner() {
     h('span', {}, '🧪'),
     h('span', { class: 'grow small' },
       h('strong', {}, 'Demo mode. '),
-      "Firebase isn't connected yet, so everything stays in this browser. Open a second tab to act as another phone."));
+      "Nothing here touches your real family data; it stays in this browser. Open a second tab to act as another phone."));
 }
 
 function loadingView(key = 'loading') {
@@ -873,7 +946,10 @@ function statsView() {
             ? [h('div', { class: 'muted small' }, 'Position in the list when they decided:'),
               h('div', { class: 'chips' }, entries.map(([pos, n]) => h('span', { class: 'chip' }, `#${pos}: ${n}`)))]
             : h('div', { class: 'muted small' }, 'No decisions yet.'));
-      })));
+      }),
+      members.length > 0 && h('button', {
+        class: 'btn text block danger-text', id: 'reset-stats', disabled: total === 0, onClick: onResetStats,
+      }, 'Reset statistics')));
 }
 
 /* ---------- Elimination Game views ---------- */
@@ -883,9 +959,14 @@ function gameView() {
   const g = S.game;
   if (!S.store || g === undefined) return loadingView('game-loading');
   if (g === null) {
-    return messageView('game-ended', 'This game has ended',
-      `There's no game with code ${code} any more. It may have been ended by the host.`,
-      'Back to home', goBack);
+    const current = S.family && S.family.activeGame && S.family.activeGame !== code ? S.family.activeGame : null;
+    return current
+      ? messageView('game-ended', 'This game has ended',
+        'The host ended this game or replaced it with a new one. Your family has another game in progress.',
+        'Join the current game', () => location.replace('#/game/' + current))
+      : messageView('game-ended', 'This game has ended',
+        `There's no game with code ${code} any more. It may have been ended by the host.`,
+        'Back to home', goBack);
   }
   const isHost = g.host === S.clientId;
   const titles = { lobby: 'Players', options: 'Add options', eliminate: 'Eliminate', winner: 'Decision made!' };
@@ -893,12 +974,25 @@ function gameView() {
     lobby: lobbyPhase, options: optionsPhase, eliminate: eliminatePhase, winner: winnerPhase,
   }[g.phase](g, isHost);
 
+  // Warn if this phone is in an old game while the family plays a different one.
+  const current = S.family && g.family === S.familyCode && S.family.activeGame && S.family.activeGame !== code
+    ? S.family.activeGame : null;
+  const hasPlayerHere = g.players.some((p) => p.device === S.clientId);
+
   return h('div', { class: 'screen', 'data-key': `game-${code}-${g.phase}` },
     appBar('🎲 ' + titles[g.phase], {
       back: true,
       actions: [h('span', { class: 'tag code-tag', title: 'Game code' }, code)],
     }),
-    h('main', { class: 'content' }, demoBanner(), body));
+    h('main', { class: 'content' },
+      demoBanner(),
+      current && h('div', { class: 'banner demo', id: 'other-game-banner' },
+        h('span', {}, '⚠️'),
+        h('span', { class: 'grow small' }, "This isn't your family's current game."),
+        h('button', { class: 'btn primary', onClick: () => location.replace('#/game/' + current) }, 'Switch')),
+      body,
+      !isHost && hasPlayerHere && h('div', { class: 'center takeover' },
+        h('button', { class: 'btn text small', id: 'take-over', onClick: onTakeOver }, "Host's phone stuck? Take over as host"))));
 }
 
 function lobbyPhase(g, isHost) {
@@ -929,13 +1023,14 @@ function lobbyPhase(g, isHost) {
         : h('ul', { class: 'list' }, g.players.map((p) => h('li', { 'data-key': 'p-' + p.id },
           h('span', { class: 'grow' }, p.name),
           p.device === S.clientId && h('span', { class: 'tag' }, 'this phone'),
+          p.device === g.host && p.device !== S.clientId && h('span', { class: 'tag muted-tag' }, "host's phone"),
           (p.device === S.clientId || isHost) && h('button', {
             class: 'icon-btn sm', 'aria-label': `Remove ${p.name}`, onClick: () => run(() => removePlayer(p.id)),
           }, '×'))))),
 
     h('section', { class: 'card', id: 'add-player-card' },
       h('h2', {}, mine.length ? 'Add more players on this phone' : 'Who is playing on this phone?'),
-      h('p', { class: 'muted small' }, 'Tap your name. If several people share this phone, add each of them.'),
+      h('p', { class: 'muted small' }, 'Tap your name. If several people share this phone, add each of them. Each person can only play from one phone.'),
       suggestions.length > 0 && h('div', { class: 'chips' },
         suggestions.map((n) => h('button', { class: 'chip', 'data-key': 's-' + n, onClick: () => run(() => addPlayer(n)) }, '+ ' + n))),
       h('form', { class: 'row', onSubmit: submitName },

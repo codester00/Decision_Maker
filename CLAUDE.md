@@ -1,0 +1,35 @@
+# CLAUDE.md
+
+Notes for Claude sessions working on this repo. The README has the user-facing feature list and setup.
+
+## What this is
+Family Decision Maker: a mobile-first web app that several phones use together live. It's plain HTML/CSS/vanilla JS (ES modules) with **no build step and no npm dependencies**. Firebase Firestore provides real-time sync. It's hosted on GitHub Pages from `main` at https://codester00.github.io/Decision_Maker/.
+
+The owner is not a developer. Explain things in plain language and give copy-paste-ready snippets and click-by-click steps for anything they must do themselves (Firebase console, GitHub settings).
+
+## Files
+- `js/app.js`: everything UI. A tiny `h()` DOM builder, a keyed DOM patcher (`patch`/`patchChildren`) so inputs keep focus while other phones' updates stream in, state `S`, hash routing (`#/`, `#/stats`, `#/game/CODE`, `#/join/CODE`), actions, views.
+- `js/store.js`: data layer with two backends. `FirebaseStore` (Firestore plus anonymous auth, SDK loaded from gstatic CDN v10.14.1) and `LocalStore` (localStorage; `storage` events sync between tabs). Interface: `watch`, `get`, `update(col, id, fn)`, where `fn(cur)` returns the new doc, `null` to delete, or `undefined` for no-op, and throwing aborts. **All writes go through `update` (a transaction).**
+- `js/firebase-config.js`: the real project config (project `decision-maker-6207f`). Not secret.
+- `firestore.rules`: the source of truth for the rules, but **changes must be pasted into the Firebase console by the owner** (Firestore → Rules → Publish). No Firebase CLI is set up.
+
+## Data model
+- `families/{code}`: `{ members: [{id, name, decisions, positions: {"1": n}}], activeGame, createdAt }`. The `members` array order is the priority order.
+- `games/{code}`: `{ host, family, phase: lobby|options|eliminate|winner, players: [{id, name, device}], options: [{id, text}], order, turn, winner, familyNames, createdAt }`.
+- `device` is a per-phone client id (localStorage; per tab in demo mode).
+- Real family data lives in Firestore, so **keep the code compatible with existing documents** (treat new fields as optional, default them on read).
+
+## Rules the owner agreed to (don't break them)
+- Elimination Game never touches the priority list or stats, stores no record of who suggested or eliminated what, and is deleted when the host ends it.
+- Only one game per family: claim `activeGame` atomically (compare-and-set in `createGame`); replacing a game deletes the old one.
+- A player name appears once per game and belongs to exactly one phone.
+- Delete/Edit modes stay on until Done. Deferring (tapping someone below #1) asks for confirmation.
+
+## Testing
+- **The sandbox can't reach gstatic.com or github.io**, so the app can't run against real Firebase in a browser here. Test UI in **demo mode**: serve with `python3 -m http.server 8765` and open `http://localhost:8765/?demo`. `?demo` forces LocalStore and uses separate prefs (`fdm:pref:demo:*`), so it never mixes with real data.
+- Simulate multiple phones with Playwright: several pages in **one** browser context share localStorage, and each page gets its own client id.
+- Firebase backend checks (auth, rules) can be done from Node with the `firebase` npm package in the scratchpad (googleapis hosts are reachable).
+- Run `node --check js/*.js` before committing. Never commit test scripts or `node_modules`.
+
+## Deploying
+Pushing to `main` deploys via GitHub Pages in about a minute. Phones pick it up on refresh (home-screen app: close and reopen).

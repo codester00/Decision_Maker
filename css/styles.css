@@ -171,6 +171,9 @@ button.chip:hover { border-color: var(--primary); }
   font-weight: 600;
   white-space: nowrap;
 }
+.muted-tag { background: var(--surface-2); color: var(--muted); }
+.danger-text { color: var(--danger) !important; }
+.takeover { margin-top: 18px; }
 .code-tag { font-size: .85rem; letter-spacing: .1em; padding: 4px 10px; }
 .big-code { font-size: 2.2rem; font-weight: 800; letter-spacing: .2em; text-align: center; color: var(--primary); margin: 4px 0 8px; }
 .link-box { word-break: break-all; background: var(--surface-2); padding: 10px; border-radius: 10px; font-size: .9rem; user-select: all; }
